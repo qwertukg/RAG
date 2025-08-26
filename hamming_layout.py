@@ -3,15 +3,25 @@
 """
 Матрица попарных расстояний Хэмминга для кодов выбранной цифры.
 
-Скрипт берёт все коды указанной цифры из mnist_memory.npz, вычисляет
+
+Берёт все коды заданной цифры из ``mnist_memory.npz``, вычисляет
 матрицу попарных расстояний Хэмминга и визуализирует её как градиент
 значений 0..1 в матрице точек (#000..#fff).
+
+Все параметры задаются константами ниже, без поддержки CLI.
 """
-import argparse
+
+
 import numpy as np
 import matplotlib.pyplot as plt
-
 from map import draw_points_matrix
+
+
+# Константы конфигурации
+MEMORY_FILE = "mnist_memory.npz"
+DIGIT = 3
+LIMIT = 256  # установите None, чтобы брать все коды
+OUT_PATH = "hamming_matrix.png"
 
 
 def pairwise_hamming(codes: np.ndarray) -> np.ndarray:
@@ -24,21 +34,14 @@ def pairwise_hamming(codes: np.ndarray) -> np.ndarray:
 
 
 def main():
-    p = argparse.ArgumentParser(description="Матрица расстояний Хэмминга")
-    p.add_argument("--memory", default="mnist_memory.npz", help="файл с кодами памяти")
-    p.add_argument("--digit", type=int, default=3, help="какую цифру визуализировать (0-9)")
-    p.add_argument("--limit", type=int, default=None, help="ограничить количество кодов (для отладки)")
-    p.add_argument("--out", default="hamming_matrix.png", help="куда сохранить PNG")
-    args = p.parse_args()
-
-    data = np.load(args.memory)
+    data = np.load(MEMORY_FILE)
     labels = data["train_labels"]
-    mask = labels == args.digit
+    mask = labels == DIGIT
     codes = data["train_codes"][mask]
-    if args.limit is not None:
-        codes = codes[: args.limit]
+    if LIMIT is not None:
+        codes = codes[: LIMIT]
     if len(codes) == 0:
-        raise ValueError(f"В памяти нет кодов для цифры {args.digit}")
+        raise ValueError(f"В памяти нет кодов для цифры {DIGIT}")
 
     mat = pairwise_hamming(codes)
 
@@ -46,8 +49,9 @@ def main():
     fig, ax = plt.subplots(figsize=(max(4, n / 5), max(4, n / 5)))
     draw_points_matrix(ax, mat, square_marker=True)
     fig.tight_layout()
-    fig.savefig(args.out, dpi=150)
-    print(f"Сохранено в {args.out}")
+
+    fig.savefig(OUT_PATH, dpi=150)
+    print(f"Сохранено в {OUT_PATH}")
 
 
 if __name__ == "__main__":
