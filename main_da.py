@@ -9,7 +9,7 @@ import numpy as np, json
 GRID = 7                # 28x28 -> 7x7 (пуллинг усреднением)
 LEVELS = 4              # кванты яркости: 0..LEVELS (0 = "пусто")
 BITS_PER_CELL = 128     # длина бит-вектора для одной ячейки (конкатенация по всем ячейкам)
-K_BITS_PER_LEVEL = 6    # число единиц в коде уровня (constant-weight)
+K_BITS_PER_LEVEL = 16    # число единиц в коде уровня (constant-weight)
 KNN_K = 7               # число соседей для fuzzy-поиска (§2.2.5)
 TRAIN_LIMIT = None      # можно поставить 20000 для ускорения
 SEED = 42

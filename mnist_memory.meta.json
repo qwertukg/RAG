@@ -1,10 +1,10 @@
 {
   "GRID": 7,
   "LEVELS": 4,
-  "BITS_PER_CELL": 64,
-  "K_BITS_PER_LEVEL": 6,
+  "BITS_PER_CELL": 128,
+  "K_BITS_PER_LEVEL": 16,
   "KNN_K": 7,
   "SEED": 42,
   "block_order": "row-major (t=r*GRID+c)",
-  "dtype": "uint64 per block, 49 blocks per image"
+  "dtype": "2xuint64 per block, 49 blocks per image"
 }

@@ -80,6 +80,6 @@ def infer(image_path, K=7, mem_path=MEM_NPZ, meta_path=META_JSON):
 
 # ---- CLI: печать JSON ----
 if __name__ == "__main__":
-    img_path = sys.argv[1] if len(sys.argv) > 1 else "sample.png"
+    img_path = sys.argv[1] if len(sys.argv) > 1 else "sample2.png"
     res = infer(img_path)
     print(json.dumps(res, ensure_ascii=False))
