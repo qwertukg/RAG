@@ -24,11 +24,11 @@ from map import draw_points_matrix
 
 # Константы конфигурации
 MEMORY_FILE = "mnist_memory.npz"
-DIGIT = 3
+DIGIT = 2
 LIMIT = 256  # установите None, чтобы брать все коды
 OUT_MATRIX_PATH = "hamming_matrix.png"
 OUT_LAYOUT_PATH = "hamming_layout.png"
-POINT_SIZE = 100  # размер маркера точки при визуализации
+POINT_SIZE = 1  # размер маркера точки при визуализации
 
 
 def pairwise_hamming(codes: np.ndarray) -> np.ndarray:
@@ -66,14 +66,6 @@ def main():
         raise ValueError(f"В памяти нет кодов для цифры {DIGIT}")
 
     mat = pairwise_hamming(codes)
-
-    # ---- изображение матрицы расстояний ----
-    n = mat.shape[0]
-    fig, ax = plt.subplots(figsize=(max(4, n / 5), max(4, n / 5)))
-    draw_points_matrix(ax, mat, square_marker=True, point_size=POINT_SIZE)
-    fig.tight_layout()
-    fig.savefig(OUT_MATRIX_PATH, dpi=150)
-    print(f"Сохранено в {OUT_MATRIX_PATH}")
 
     # ---- 2D-раскладка по расстояниям ----
     coords = classical_mds(mat)
