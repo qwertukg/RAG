@@ -11,7 +11,7 @@ WEIGHTS_PATH = "mnist_cnn.pt"
 
 
 class Net(nn.Module):
-    """Простая CNN как в main.py для классификации MNIST."""
+    """Простая CNN как в main_cnn.py для классификации MNIST."""
 
     def __init__(self):
         super().__init__()
