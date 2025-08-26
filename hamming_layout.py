@@ -22,15 +22,18 @@ MEMORY_FILE = "mnist_memory.npz"
 DIGIT = 3
 LIMIT = 256  # установите None, чтобы брать все коды
 OUT_PATH = "hamming_matrix.png"
+POINT_SIZE = 100  # размер маркера точки при визуализации
 
 
 def pairwise_hamming(codes: np.ndarray) -> np.ndarray:
     """Возвращает нормированную матрицу попарных расстояний Хэмминга."""
-    bits = np.unpackbits(codes.view(np.uint8).reshape(len(codes), -1), axis=1)
+    bits = np.unpackbits(
+        codes.view(np.uint8).reshape(len(codes), -1), axis=1
+    ).astype(np.int32)
     pop = bits.sum(axis=1, keepdims=True)
-    inter = bits @ bits.T
+    inter = bits @ bits.T  # пересечение
     dist = pop + pop.T - 2 * inter
-    return dist / bits.shape[1]
+    return dist.astype(np.float32) / bits.shape[1]
 
 
 def main():
@@ -47,7 +50,7 @@ def main():
 
     n = mat.shape[0]
     fig, ax = plt.subplots(figsize=(max(4, n / 5), max(4, n / 5)))
-    draw_points_matrix(ax, mat, square_marker=True)
+    draw_points_matrix(ax, mat, square_marker=True, point_size=POINT_SIZE)
     fig.tight_layout()
 
     fig.savefig(OUT_PATH, dpi=150)

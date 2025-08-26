@@ -29,7 +29,7 @@ except Exception as e:
     transforms = None
 
 # --------- утилиты рисования матрицы точек (строго #000..#fff) ---------
-def draw_points_matrix(ax, mat, title=None, square_marker=True):
+def draw_points_matrix(ax, mat, title=None, square_marker=True, point_size=100):
     """
     Рисует матрицу значений mat как решётку точек со шкалой 0..1 => #000..#fff.
     """
@@ -44,7 +44,14 @@ def draw_points_matrix(ax, mat, title=None, square_marker=True):
     colors = ['#%02x%02x%02x' % (v, v, v) for v in rgb[:, 0]]
 
     marker = 's' if square_marker else 'o'
-    ax.scatter(xs.flatten()+0.5, (h - ys.flatten()) - 0.5, c=colors, s=100, marker=marker, edgecolors='none')
+    ax.scatter(
+        xs.flatten() + 0.5,
+        (h - ys.flatten()) - 0.5,
+        c=colors,
+        s=point_size,
+        marker=marker,
+        edgecolors='none',
+    )
     ax.set_xlim(0, w); ax.set_ylim(0, h)
     ax.set_xticks([]); ax.set_yticks([])
     if title: ax.set_title(title, fontsize=10, pad=4)
