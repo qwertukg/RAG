@@ -10,10 +10,10 @@ META_JSON = "mnist_memory.meta.json"
 
 def load_memory(mem_path=MEM_NPZ, meta_path=META_JSON):
     mem = np.load(mem_path)
-    train_codes  = mem["train_codes"]        # shape: (N, B) uint64
+    train_codes  = mem["train_codes"]        # shape: (N, B, 2) uint64
     train_labels = mem["train_labels"]       # shape: (N,)
     train_pop    = mem["train_pop"]          # shape: (N,)
-    LEVEL_CODE   = list(mem["LEVEL_CODE"].astype(np.uint64))  # list length = LEVELS+1
+    LEVEL_CODE   = [arr.astype(np.uint64) for arr in mem["LEVEL_CODE"]]  # list length = LEVELS+1
     # мета — для GRID/LEVELS и порядка блоков
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
@@ -23,15 +23,14 @@ def load_memory(mem_path=MEM_NPZ, meta_path=META_JSON):
 
 def encode_image(img28, GRID, LEVELS, LEVEL_CODE):
     """
-    КОД ИЗОБРАЖЕНИЯ: конкатенация GRID*GRID блоков по 64 бита (uint64),
+    КОД ИЗОБРАЖЕНИЯ: конкатенация GRID*GRID блоков по 128 бит (2×uint64),
     каждый блок — код уровня яркости ячейки (0 даёт 0).
     Порядок: row-major (t = r*GRID + c).
     """
-    # усреднение 28x28 -> GRIDxGRID
     x = img28.reshape(GRID, 28//GRID, GRID, 28//GRID).mean(axis=(1,3))
     q = np.floor(np.clip(x, 0, 1) * LEVELS).astype(np.int32)
     q[q > LEVELS] = LEVELS
-    code = np.empty(GRID*GRID, dtype=np.uint64)
+    code = np.empty((GRID*GRID, 2), dtype=np.uint64)
     t = 0
     for r in range(GRID):
         for c in range(GRID):

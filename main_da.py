@@ -8,7 +8,7 @@ import numpy as np, json
 # ------------------ Параметры (глава 2) ------------------
 GRID = 7                # 28x28 -> 7x7 (пуллинг усреднением)
 LEVELS = 4              # кванты яркости: 0..LEVELS (0 = "пусто")
-BITS_PER_CELL = 64      # длина бит-вектора для одной ячейки (конкатенация по всем ячейкам)
+BITS_PER_CELL = 128     # длина бит-вектора для одной ячейки (конкатенация по всем ячейкам)
 K_BITS_PER_LEVEL = 6    # число единиц в коде уровня (constant-weight)
 KNN_K = 7               # число соседей для fuzzy-поиска (§2.2.5)
 TRAIN_LIMIT = None      # можно поставить 20000 для ускорения
@@ -26,7 +26,18 @@ def const_weight_u64(bits=64, k=6):
     for i in idx: val |= (1 << i)
     return np.uint64(val)
 
-LEVEL_CODE = [np.uint64(0)] + [const_weight_u64(BITS_PER_CELL, K_BITS_PER_LEVEL) for _ in range(LEVELS)]
+def const_weight_128(bits=128, k=6):
+    assert bits % 64 == 0 and bits >= 64
+    words = bits // 64
+    idx = rng.choice(bits, size=k, replace=False)
+    val = np.zeros(words, dtype=np.uint64)
+    for i in idx:
+        w = i // 64
+        b = i % 64
+        val[w] |= (np.uint64(1) << np.uint64(b))
+    return val
+
+LEVEL_CODE = [np.zeros(2, dtype=np.uint64)] + [const_weight_128(BITS_PER_CELL, K_BITS_PER_LEVEL) for _ in range(LEVELS)]
 
 # ------------------ Вспомогательные функции ------------------
 def avgpool_28_to_7(x28):
@@ -41,14 +52,14 @@ def quantize_levels(x7):
 
 def encode_image(img28):
     """
-    Код изображения: конкатенация 49 блоков по 64 бита.
+    Код изображения: конкатенация 49 блоков по 128 бит (два uint64).
     Каждый блок = код уровня яркости ячейки (OR из §2.2.1, но у нас один уровень -> просто код уровня).
     Конкатенация блоков по §2.2.3.
-    Возврат: np.ndarray shape (GRID*GRID,) dtype=uint64
+    Возврат: np.ndarray shape (GRID*GRID, 2) dtype=uint64
     """
     x7 = avgpool_28_to_7(img28)              # (7,7)
     q = quantize_levels(x7)                  # (7,7) в [0..LEVELS]
-    code = np.empty(GRID*GRID, dtype=np.uint64)
+    code = np.empty((GRID*GRID, 2), dtype=np.uint64)
     t = 0
     for r in range(GRID):
         for c in range(GRID):
@@ -68,8 +79,8 @@ def jaccard_blocks(query_blocks, base_blocks, base_popcnt=None):
     """
     Жаккар для конкатенированной битовой записи (§2.2.4.2):
         J = |A∧B| / |A∨B|.
-    query_blocks: (B,) uint64
-    base_blocks:  (N,B) uint64
+    query_blocks: (B,2) uint64
+    base_blocks:  (N,B,2) uint64
     base_popcnt:  (N,) int32 — precompute |B| если есть
     """
     # |A|, |B|
@@ -98,7 +109,7 @@ if TRAIN_LIMIT is None: TRAIN_LIMIT = len(train_ds)
 # ------------------ Кодирование памяти (memory, для fuzzy-поиска §2.2.5) ------------------
 N = TRAIN_LIMIT
 B = GRID * GRID
-train_codes = np.empty((N, B), dtype=np.uint64)
+train_codes = np.empty((N, B, 2), dtype=np.uint64)
 train_labels = np.empty((N,), dtype=np.int16)
 
 for i in tqdm(range(N), desc="Кодирую train"):
@@ -149,5 +160,5 @@ with open("mnist_memory.meta.json","w", encoding="utf-8") as f:
         "KNN_K": KNN_K,
         "SEED": SEED,
         "block_order": "row-major (t=r*GRID+c)",
-        "dtype": "uint64 per block, 49 blocks per image"
+        "dtype": "2xuint64 per block, 49 blocks per image"
     }, f, ensure_ascii=False, indent=2)
