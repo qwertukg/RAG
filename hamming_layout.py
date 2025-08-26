@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Матрица попарных расстояний Хэмминга для кодов выбранной цифры.
+Визуализация попарных расстояний Хэмминга для кодов выбранной цифры.
 
+Берёт все коды заданной цифры из ``mnist_memory.npz``, вычисляет матрицу
+попарных расстояний Хэмминга и сохраняет две картинки:
 
-Берёт все коды заданной цифры из ``mnist_memory.npz``, вычисляет
-матрицу попарных расстояний Хэмминга и визуализирует её как градиент
-значений 0..1 в матрице точек (#000..#fff).
+* ``hamming_matrix.png`` — та же матрица как градиент значений 0..1 в
+  равномерной решётке точек (#000..#fff);
+* ``hamming_layout.png`` — 2D‑раскладка кодов, в которой евклидовы
+  расстояния между точками приближённо соответствуют хэмминговым.
 
 Все параметры задаются константами ниже, без поддержки CLI.
 """
@@ -14,6 +17,8 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
+from numpy.linalg import eigh
+
 from map import draw_points_matrix
 
 
@@ -21,7 +26,8 @@ from map import draw_points_matrix
 MEMORY_FILE = "mnist_memory.npz"
 DIGIT = 3
 LIMIT = 256  # установите None, чтобы брать все коды
-OUT_PATH = "hamming_matrix.png"
+OUT_MATRIX_PATH = "hamming_matrix.png"
+OUT_LAYOUT_PATH = "hamming_layout.png"
 POINT_SIZE = 100  # размер маркера точки при визуализации
 
 
@@ -36,6 +42,19 @@ def pairwise_hamming(codes: np.ndarray) -> np.ndarray:
     return dist.astype(np.float32) / bits.shape[1]
 
 
+def classical_mds(dist: np.ndarray, n_components: int = 2) -> np.ndarray:
+    """Классическое MDS (метод Торгерсона) для раскладки по расстояниям."""
+    n = dist.shape[0]
+    # матрица удвоенного центрирования
+    H = np.eye(n) - np.ones((n, n)) / n
+    B = -0.5 * H @ (dist ** 2) @ H
+    evals, evecs = eigh(B)
+    idx = np.argsort(evals)[::-1]
+    evals, evecs = evals[idx], evecs[:, idx]
+    w = np.maximum(evals[:n_components], 0)
+    return evecs[:, :n_components] * np.sqrt(w)
+
+
 def main():
     data = np.load(MEMORY_FILE)
     labels = data["train_labels"]
@@ -48,13 +67,24 @@ def main():
 
     mat = pairwise_hamming(codes)
 
+    # ---- изображение матрицы расстояний ----
     n = mat.shape[0]
     fig, ax = plt.subplots(figsize=(max(4, n / 5), max(4, n / 5)))
     draw_points_matrix(ax, mat, square_marker=True, point_size=POINT_SIZE)
     fig.tight_layout()
+    fig.savefig(OUT_MATRIX_PATH, dpi=150)
+    print(f"Сохранено в {OUT_MATRIX_PATH}")
 
-    fig.savefig(OUT_PATH, dpi=150)
-    print(f"Сохранено в {OUT_PATH}")
+    # ---- 2D-раскладка по расстояниям ----
+    coords = classical_mds(mat)
+    avg_dist = mat.mean(axis=1)
+    fig2, ax2 = plt.subplots(figsize=(6, 6))
+    ax2.scatter(coords[:, 0], coords[:, 1], c=avg_dist, cmap="gray", s=POINT_SIZE)
+    ax2.set_xticks([]); ax2.set_yticks([])
+    ax2.set_aspect('equal', 'datalim')
+    fig2.tight_layout()
+    fig2.savefig(OUT_LAYOUT_PATH, dpi=150)
+    print(f"Сохранено в {OUT_LAYOUT_PATH}")
 
 
 if __name__ == "__main__":
