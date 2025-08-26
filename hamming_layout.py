@@ -3,6 +3,7 @@
 """
 Матрица попарных расстояний Хэмминга для кодов выбранной цифры.
 
+
 Берёт все коды заданной цифры из ``mnist_memory.npz``, вычисляет
 матрицу попарных расстояний Хэмминга и визуализирует её как градиент
 значений 0..1 в матрице точек (#000..#fff).
@@ -10,10 +11,11 @@
 Все параметры задаются константами ниже, без поддержки CLI.
 """
 
+
 import numpy as np
 import matplotlib.pyplot as plt
-
 from map import draw_points_matrix
+
 
 # Константы конфигурации
 MEMORY_FILE = "mnist_memory.npz"
@@ -29,6 +31,7 @@ def pairwise_hamming(codes: np.ndarray) -> np.ndarray:
     inter = bits @ bits.T
     dist = pop + pop.T - 2 * inter
     return dist / bits.shape[1]
+
 
 def main():
     data = np.load(MEMORY_FILE)
@@ -46,6 +49,7 @@ def main():
     fig, ax = plt.subplots(figsize=(max(4, n / 5), max(4, n / 5)))
     draw_points_matrix(ax, mat, square_marker=True)
     fig.tight_layout()
+
     fig.savefig(OUT_PATH, dpi=150)
     print(f"Сохранено в {OUT_PATH}")
 
