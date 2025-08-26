@@ -24,7 +24,7 @@ from map import draw_points_matrix
 
 # Константы конфигурации
 MEMORY_FILE = "mnist_memory.npz"
-DIGIT = 2
+DIGIT = 3
 LIMIT = 256  # установите None, чтобы брать все коды
 OUT_MATRIX_PATH = "hamming_matrix.png"
 OUT_LAYOUT_PATH = "hamming_layout.png"
