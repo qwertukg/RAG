@@ -3,16 +3,15 @@
 """
 Визуализация попарных косинусных расстояний для признаковых векторов CNN.
 
-Берёт признаки указаных цифр из обученного ``mnist_cnn.pt``, вычисляет матрицу
-косинусных расстояний и строит 2D-раскладку методом классического MDS.
-Точки раскрашиваются в соответствии с заданными цветами для каждой цифры.
-Все параметры задаются константами ниже, без поддержки CLI.
+Берёт признаки указанных цифр из обученного ``mnist_cnn.pt`` и строит
+2D‑раскладку методом классического MDS, чтобы показать реальные расстояния
+между признаками. Точки раскрашиваются в соответствии с заданными цветами
+для каждой цифры. Все параметры задаются константами ниже, без поддержки
+CLI.
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-from numpy.linalg import eigh
-from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -54,12 +53,10 @@ class Net(nn.Module):
         return logits, feats
 
 
-def pairwise_cosine(vecs: np.ndarray) -> np.ndarray:
-    """Возвращает матрицу попарных косинусных расстояний (1 - cos)."""
-    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    sim = vecs @ vecs.T / (norms * norms.T)
-    return 1.0 - sim
+def pairwise_cosine(vecs: torch.Tensor) -> torch.Tensor:
+    """Матрица попарных косинусных расстояний (1 - cos) для тензора."""
+    vecs = F.normalize(vecs, p=2, dim=1)
+    return 1.0 - vecs @ vecs.T
 
 
 def classical_mds(dist: np.ndarray, n_components: int = 2) -> np.ndarray:
@@ -67,7 +64,7 @@ def classical_mds(dist: np.ndarray, n_components: int = 2) -> np.ndarray:
     n = dist.shape[0]
     H = np.eye(n) - np.ones((n, n)) / n
     B = -0.5 * H @ (dist ** 2) @ H
-    evals, evecs = eigh(B)
+    evals, evecs = np.linalg.eigh(B)
     idx = np.argsort(evals)[::-1]
     evals, evecs = evals[idx], evecs[:, idx]
     w = np.maximum(evals[:n_components], 0)
@@ -98,16 +95,17 @@ def main():
         for x, _ in loader:
             x = x.to(device)
             _, feats = net(x)
-            feats_list.append(feats.detach().cpu().numpy())
-        feats_arr = np.concatenate(feats_list, axis=0)
+            feats_list.append(feats.detach().cpu())
+        feats_arr = torch.cat(feats_list, dim=0)
         sel_codes.append(feats_arr)
-        sel_labels.append(np.full(len(feats_arr), digit, dtype=np.int64))
+        sel_labels.append(torch.full((feats_arr.size(0),), digit, dtype=torch.int64))
 
-    codes = np.concatenate(sel_codes, axis=0)
-    labels = np.concatenate(sel_labels, axis=0)
+    codes = torch.cat(sel_codes, dim=0)
+    labels = torch.cat(sel_labels, dim=0).numpy()
 
-    mat = pairwise_cosine(codes)
-    coords = classical_mds(mat)
+    # Матрица попарных косинусных расстояний и MDS-раскладка
+    dist = pairwise_cosine(codes).numpy()
+    coords = classical_mds(dist)
 
     fig, ax = plt.subplots(figsize=(6, 6))
     for digit, color in DIGIT_COLORS.items():
@@ -117,7 +115,7 @@ def main():
     ax.set_yticks([])
     ax.set_aspect('equal', 'datalim')
     ax.legend(title="digit")
-    ax.set_title("CNN features cosine layout")
+    ax.set_title("CNN features cosine distance layout")
     fig.tight_layout()
     file_name = "-".join([OUT_LAYOUT_PATH, *map(str, DIGIT_COLORS)]) + ".png"
     fig.savefig(file_name, dpi=150)
