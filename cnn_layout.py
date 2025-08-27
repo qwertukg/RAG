@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Визуализация расстояний между скрытыми признаками CNN без применения MDS.
+Визуализация расстояний между скрытыми признаками CNN с помощью UMAP.
 
 Берёт изображения указанных цифр из набора MNIST, пропускает их через обученную
-сверточную сеть (как в main_cnn.py) и строит 2D‑раскладку по первым двум
-главным компонентам признаков слоя f1. Точки раскрашиваются по цифрам.
-Все параметры задаются константами ниже, CLI не поддерживается.
+сверточную сеть (как в main_cnn.py) и строит 2D‑раскладку с помощью алгоритма
+UMAP. Точки раскрашиваются по цифрам. Все параметры задаются константами ниже,
+CLI не поддерживается.
 """
 
 import numpy as np
@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
+import umap
 
 try:
     from main_cnn import Net
@@ -59,11 +60,10 @@ def extract_f1_features(net: Net, digits) -> tuple[np.ndarray, np.ndarray]:
     return np.stack(feats), np.array(labels, dtype=np.int16)
 
 
-def pca_2d(X: np.ndarray) -> np.ndarray:
-    """Проецирует векторы X на две главные компоненты."""
-    Xc = X - X.mean(axis=0)
-    U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
-    return Xc @ Vt[:2].T
+def umap_2d(X: np.ndarray) -> np.ndarray:
+    """Строит двумерную раскладку признаков X с помощью UMAP."""
+    reducer = umap.UMAP(n_components=2, random_state=42)
+    return reducer.fit_transform(X)
 
 
 def main() -> None:
@@ -73,7 +73,7 @@ def main() -> None:
 
     digits = list(DIGIT_COLORS.keys())
     feats, labels = extract_f1_features(net, digits)
-    coords = pca_2d(feats)
+    coords = umap_2d(feats)
 
     fig, ax = plt.subplots(figsize=(6, 6))
     for digit, color in DIGIT_COLORS.items():
@@ -83,7 +83,7 @@ def main() -> None:
     ax.set_yticks([])
     ax.set_aspect("equal", "datalim")
     ax.legend(title="digit")
-    ax.set_title("CNN features PCA")
+    ax.set_title("CNN features UMAP")
     fig.tight_layout()
     fig.savefig(OUT_LAYOUT_PATH, dpi=150)
     print(f"Сохранено в {OUT_LAYOUT_PATH}")
