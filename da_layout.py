@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
-from umap import UMAP
+import umap
 
 # Параметры конфигурации из мета-файла
 META_JSON = "mnist_memory.meta.json"
@@ -26,19 +26,13 @@ BITS_PER_CELL = int(meta["BITS_PER_CELL"])
 K_BITS_PER_LEVEL = int(meta["K_BITS_PER_LEVEL"])
 SEED = int(meta["SEED"])
 
-DIGIT_COLORS = {0: "red", 1: "blue", 2: "green", 3: "yellow", 4: "orange", 5: "purple", 6: "pink", 7: "brown", 8: "gray", 9: "black"}
+# DIGIT_COLORS = {0: "red", 1: "blue", 2: "green", 3: "yellow", 4: "orange", 5: "purple", 6: "pink", 7: "brown", 8: "gray", 9: "black"}
 # DIGIT_COLORS = {0: "red", 1: "blue"}
-# DIGIT_COLORS = {6: "green", 9: "yellow"}
+DIGIT_COLORS = {6: "green", 9: "yellow"}
 
 LIMIT = None  # установите None, чтобы брать все изображения каждой цифры
 OUT_LAYOUT_PATH = "da_layout.png"
 POINT_SIZE = 1  # размер маркера точки при визуализации
-
-# Параметры UMAP
-UMAP_METRIC = "cosine"
-N_NEIGHBORS = 15
-MIN_DIST = 0.1
-OUT_DATA_PATH = "da_layout_coords.npz"
 
 
 rng = np.random.default_rng(SEED)
@@ -115,17 +109,8 @@ def main() -> None:
     digits = list(DIGIT_COLORS.keys())
     codes, labels = extract_codes(digits)
     bits = codes_to_bits(codes)
-    umap_model = UMAP(
-        densmap=True,
-        output_dens=True,
-        random_state=SEED,
-        metric=UMAP_METRIC,
-        n_neighbors=N_NEIGHBORS,
-        min_dist=MIN_DIST,
-    )
-    coords, dens_orig, dens_emb = umap_model.fit_transform(bits)
-    dens = (dens_orig, dens_emb)
-    np.savez_compressed(OUT_DATA_PATH, coords=coords, dens_orig=dens_orig, dens_emb=dens_emb)
+    umap_model = umap.UMAP(n_components=2, metric="cosine", random_state=SEED)
+    coords = umap_model.fit_transform(bits)
 
     fig, ax = plt.subplots(figsize=(6, 6))
     for digit, color in DIGIT_COLORS.items():
@@ -140,7 +125,6 @@ def main() -> None:
     fig.tight_layout()
     fig.savefig(OUT_LAYOUT_PATH, dpi=150)
     print(f"Сохранено в {OUT_LAYOUT_PATH}")
-    print(f"Координаты и плотности сохранены в {OUT_DATA_PATH}")
 
 
 if __name__ == "__main__":
