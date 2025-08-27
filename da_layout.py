@@ -25,9 +25,11 @@ LEVELS = int(meta["LEVELS"])
 BITS_PER_CELL = int(meta["BITS_PER_CELL"])
 K_BITS_PER_LEVEL = int(meta["K_BITS_PER_LEVEL"])
 SEED = int(meta["SEED"])
+
 DIGIT_COLORS = {0: "red", 1: "blue", 2: "green", 3: "yellow", 4: "orange", 5: "purple", 6: "pink", 7: "brown", 8: "gray", 9: "black"}
 # DIGIT_COLORS = {0: "red", 1: "blue"}
 # DIGIT_COLORS = {6: "green", 9: "yellow"}
+
 LIMIT = None  # установите None, чтобы брать все изображения каждой цифры
 OUT_LAYOUT_PATH = "da_layout.png"
 POINT_SIZE = 1  # размер маркера точки при визуализации
@@ -113,7 +115,8 @@ def main() -> None:
     fig, ax = plt.subplots(figsize=(6, 6))
     for digit, color in DIGIT_COLORS.items():
         mask = labels == digit
-        ax.scatter(coords[mask, 0], coords[mask, 1], c=color, s=POINT_SIZE, label=str(digit))
+        ax.scatter(coords[mask, 0], coords[mask, 1], c=color, s=POINT_SIZE, label=str(digit),
+                   marker=',', antialiased=True, linewidths=0, alpha=0.5)
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_aspect("equal", "datalim")

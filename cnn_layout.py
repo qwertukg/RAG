@@ -79,7 +79,8 @@ def main() -> None:
     fig, ax = plt.subplots(figsize=(6, 6))
     for digit, color in DIGIT_COLORS.items():
         mask = labels == digit
-        ax.scatter(coords[mask, 0], coords[mask, 1], c=color, s=POINT_SIZE, label=str(digit))
+        ax.scatter(coords[mask, 0], coords[mask, 1], c=color, s=POINT_SIZE, label=str(digit),
+                   marker=',', antialiased=True, linewidths=0, alpha=0.5)
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_aspect("equal", "datalim")
