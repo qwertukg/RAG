@@ -3,16 +3,13 @@
 """
 Визуализация попарных косинусных расстояний для признаковых векторов CNN.
 
-Берёт признаки указаных цифр из обученного ``mnist_cnn.pt``, вычисляет матрицу
-косинусных расстояний и строит 2D-раскладку методом классического MDS.
-Точки раскрашиваются в соответствии с заданными цветами для каждой цифры.
-Все параметры задаются константами ниже, без поддержки CLI.
+Берёт признаки указанных цифр из обученного ``mnist_cnn.pt`` и строит
+тепловую карту их попарных косинусных расстояний. Все параметры задаются
+константами ниже, без поддержки CLI.
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-from numpy.linalg import eigh
-from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -25,7 +22,6 @@ WEIGHTS_PATH = "mnist_cnn.pt"
 DIGIT_COLORS = {0: "red", 1: "blue"}
 LIMIT = None  # установите None, чтобы брать все коды для каждой цифры
 OUT_LAYOUT_PATH = "cnn_layout"
-POINT_SIZE = 1  # размер маркера точки при визуализации
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -54,24 +50,10 @@ class Net(nn.Module):
         return logits, feats
 
 
-def pairwise_cosine(vecs: np.ndarray) -> np.ndarray:
-    """Возвращает матрицу попарных косинусных расстояний (1 - cos)."""
-    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    sim = vecs @ vecs.T / (norms * norms.T)
-    return 1.0 - sim
-
-
-def classical_mds(dist: np.ndarray, n_components: int = 2) -> np.ndarray:
-    """Классическое MDS (метод Торгерсона) для раскладки по расстояниям."""
-    n = dist.shape[0]
-    H = np.eye(n) - np.ones((n, n)) / n
-    B = -0.5 * H @ (dist ** 2) @ H
-    evals, evecs = eigh(B)
-    idx = np.argsort(evals)[::-1]
-    evals, evecs = evals[idx], evecs[:, idx]
-    w = np.maximum(evals[:n_components], 0)
-    return evecs[:, :n_components] * np.sqrt(w)
+def pairwise_cosine(vecs: torch.Tensor) -> torch.Tensor:
+    """Матрица попарных косинусных расстояний (1 - cos) для тензора."""
+    vecs = F.normalize(vecs, p=2, dim=1)
+    return 1.0 - vecs @ vecs.T
 
 
 def main():
@@ -98,26 +80,37 @@ def main():
         for x, _ in loader:
             x = x.to(device)
             _, feats = net(x)
-            feats_list.append(feats.detach().cpu().numpy())
-        feats_arr = np.concatenate(feats_list, axis=0)
+            feats_list.append(feats.detach().cpu())
+        feats_arr = torch.cat(feats_list, dim=0)
         sel_codes.append(feats_arr)
-        sel_labels.append(np.full(len(feats_arr), digit, dtype=np.int64))
+        sel_labels.append(torch.full((feats_arr.size(0),), digit, dtype=torch.int64))
 
-    codes = np.concatenate(sel_codes, axis=0)
-    labels = np.concatenate(sel_labels, axis=0)
+    codes = torch.cat(sel_codes, dim=0)
+    labels = torch.cat(sel_labels, dim=0)
 
-    mat = pairwise_cosine(codes)
-    coords = classical_mds(mat)
+    # Матрица попарных косинусных расстояний
+    mat = pairwise_cosine(codes).numpy()
+
+    # Сортируем по меткам, чтобы одинаковые цифры располагались блоками
+    idx = np.argsort(labels.numpy())
+    mat = mat[idx][:, idx]
+    labels = labels.numpy()[idx]
 
     fig, ax = plt.subplots(figsize=(6, 6))
-    for digit, color in DIGIT_COLORS.items():
-        mask = labels == digit
-        ax.scatter(coords[mask, 0], coords[mask, 1], c=color, s=POINT_SIZE, label=str(digit))
+    im = ax.imshow(mat, cmap="viridis", interpolation="nearest")
     ax.set_xticks([])
     ax.set_yticks([])
-    ax.set_aspect('equal', 'datalim')
-    ax.legend(title="digit")
-    ax.set_title("CNN features cosine layout")
+
+    # Отделяем блоки разных цифр линиями
+    counts = [np.sum(labels == d) for d in DIGIT_COLORS]
+    borders = np.cumsum(counts)[:-1]
+    for b in borders:
+        ax.axhline(b - 0.5, color="white", linewidth=0.5)
+        ax.axvline(b - 0.5, color="white", linewidth=0.5)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("cosine distance")
+    ax.set_title("CNN features cosine distance heatmap")
     fig.tight_layout()
     file_name = "-".join([OUT_LAYOUT_PATH, *map(str, DIGIT_COLORS)]) + ".png"
     fig.savefig(file_name, dpi=150)
