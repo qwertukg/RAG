@@ -33,6 +33,7 @@ DIGIT_COLORS = {6: "green", 9: "yellow"}
 LIMIT = None  # установите None, чтобы брать все изображения каждой цифры
 OUT_LAYOUT_PATH = "da_layout.png"
 POINT_SIZE = 1  # размер маркера точки при визуализации
+UMAP_METRIC = "jaccard"  # 'jaccard', 'hamming' или 'precomputed'
 
 
 rng = np.random.default_rng(SEED)
@@ -102,15 +103,42 @@ def codes_to_bits(codes: np.ndarray) -> np.ndarray:
     """Преобразует набор кодов в массив бит для последующей обработки."""
     return np.unpackbits(
         codes.view(np.uint8).reshape(len(codes), -1), axis=1
-    ).astype(np.float32)
+    ).astype(np.bool_)
+
+
+def pairwise_distance(bits: np.ndarray, metric: str) -> np.ndarray:
+    """Вычисляет попарную матрицу расстояний для заданного метрика.
+
+    Поддерживаются метрики "jaccard" и "hamming". Результат нормирован
+    в диапазон [0, 1].
+    """
+    b = bits.astype(np.uint8)
+    pop = b.sum(axis=1, dtype=np.int32)
+    inter = b @ b.T
+    if metric == "hamming":
+        dist = pop[:, None] + pop[None, :] - 2 * inter
+        return dist.astype(np.float32) / b.shape[1]
+    elif metric == "jaccard":
+        union = pop[:, None] + pop[None, :] - inter
+        # избегаем деления на ноль
+        union = np.maximum(union, 1)
+        return (1.0 - (inter / union)).astype(np.float32)
+    else:
+        raise ValueError(f"Unsupported metric: {metric}")
 
 
 def main() -> None:
     digits = list(DIGIT_COLORS.keys())
     codes, labels = extract_codes(digits)
     bits = codes_to_bits(codes)
-    umap_model = umap.UMAP(n_components=2, metric="cosine", random_state=SEED)
-    coords = umap_model.fit_transform(bits)
+    data = bits
+    metric = UMAP_METRIC
+    if metric == "precomputed":
+        # По умолчанию используем расстояние Жаккара по булевым признакам
+        data = pairwise_distance(bits, "jaccard")
+        metric = "precomputed"
+    umap_model = umap.UMAP(n_components=2, metric=metric, random_state=SEED)
+    coords = umap_model.fit_transform(data)
 
     fig, ax = plt.subplots(figsize=(6, 6))
     for digit, color in DIGIT_COLORS.items():
