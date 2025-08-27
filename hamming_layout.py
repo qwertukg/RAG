@@ -17,7 +17,7 @@ from numpy.linalg import eigh
 
 # Константы конфигурации
 MEMORY_FILE = "mnist_memory.npz"
-DIGIT_COLORS = {0: "red", 1: "blue"}
+DIGIT_COLORS = {0: "red", 1: "blue", 2: "green", 3: "yellow", 4: "orange", 5: "purple", 6: "pink", 7: "brown", 8: "gray", 9: "black"}
 LIMIT = 256  # установите None, чтобы брать все коды для каждой цифры
 OUT_LAYOUT_PATH = "hamming_layout.png"
 POINT_SIZE = 1  # размер маркера точки при визуализации

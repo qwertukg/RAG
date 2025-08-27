@@ -16,7 +16,7 @@ from numpy.linalg import eigh
 # Константы конфигурации
 MEMORY_FILE = "mnist_memory.npz"
 DIGIT_COLORS = {0: "red", 1: "blue"}
-LIMIT = 256  # установите None, чтобы брать все коды для каждой цифры
+LIMIT = None  # установите None, чтобы брать все коды для каждой цифры
 OUT_LAYOUT_PATH = "cosine_layout.png"
 POINT_SIZE = 1  # размер маркера точки при визуализации
 
