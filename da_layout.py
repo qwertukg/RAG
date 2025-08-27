@@ -6,21 +6,25 @@
 Берёт изображения указанных цифр из набора MNIST, кодирует их по правилам
 approach main_da и строит 2D-раскладку методом UMAP по косинусному
 расстоянию. Точки раскрашиваются по цифрам.
-Все параметры задаются константами ниже, CLI не поддерживается.
+Все параметры считываются из mnist_memory.meta.json.
 """
 
+import json
 import numpy as np
 import torch
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
 import umap
 
-# Константы конфигурации
-GRID = 7
-LEVELS = 4
-BITS_PER_CELL = 128
-K_BITS_PER_LEVEL = 16
-SEED = 42
+# Параметры конфигурации из мета-файла
+META_JSON = "mnist_memory.meta.json"
+with open(META_JSON, "r", encoding="utf-8") as f:
+    meta = json.load(f)
+GRID = int(meta["GRID"])
+LEVELS = int(meta["LEVELS"])
+BITS_PER_CELL = int(meta["BITS_PER_CELL"])
+K_BITS_PER_LEVEL = int(meta["K_BITS_PER_LEVEL"])
+SEED = int(meta["SEED"])
 DIGIT_COLORS = {0: "red", 1: "blue", 2: "green", 3: "yellow", 4: "orange", 5: "purple", 6: "pink", 7: "brown", 8: "gray", 9: "black"}
 # DIGIT_COLORS = {0: "red", 1: "blue"}
 # DIGIT_COLORS = {6: "green", 9: "yellow"}
