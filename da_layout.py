@@ -21,9 +21,10 @@ LEVELS = 4
 BITS_PER_CELL = 128
 K_BITS_PER_LEVEL = 16
 SEED = 42
-DIGIT_COLORS = {0: "red", 1: "blue"}
+DIGIT_COLORS = {0: "red", 1: "blue", 2: "green", 3: "yellow", 4: "orange", 5: "purple", 6: "pink", 7: "brown", 8: "gray", 9: "black"}
+# DIGIT_COLORS = {0: "red", 1: "blue"}
 # DIGIT_COLORS = {6: "green", 9: "yellow"}
-LIMIT = 256  # установите None, чтобы брать все изображения каждой цифры
+LIMIT = None  # установите None, чтобы брать все изображения каждой цифры
 OUT_LAYOUT_PATH = "da_layout.png"
 POINT_SIZE = 1  # размер маркера точки при визуализации
 
@@ -113,7 +114,7 @@ def main() -> None:
     ax.set_yticks([])
     ax.set_aspect("equal", "datalim")
     ax.legend(title="digit")
-    ax.set_title("DA codes cosine UMAP")
+    ax.set_title("Korvin approach UMAP")
     fig.tight_layout()
     fig.savefig(OUT_LAYOUT_PATH, dpi=150)
     print(f"Сохранено в {OUT_LAYOUT_PATH}")
