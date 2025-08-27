@@ -7,20 +7,6 @@ from torch.utils.data import DataLoader
 # готовые датасеты и преобразования изображений
 from torchvision import datasets, transforms
 
-# гиперпараметры обучения
-BATCH, EPOCHS, LR = 128, 3, 1e-3
-# выбираем GPU при наличии, иначе CPU
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# преобразование: в тензор и нормализация по среднему/стандартному отклонению
-tfm = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
-# загрузка обучающего и тестового набора
-train = datasets.MNIST(root="./data", train=True,  transform=tfm, download=True)
-test  = datasets.MNIST(root="./data", train=False, transform=tfm, download=True)
-# обёртывание наборов в DataLoader для итерирования по мини-батчам
-tr = DataLoader(train, batch_size=BATCH, shuffle=True, num_workers=0, pin_memory=True)
-te = DataLoader(test,  batch_size=BATCH, shuffle=False, num_workers=0, pin_memory=True)
-
 # определение простой сверточной сети
 class Net(nn.Module):
     def __init__(self):
@@ -51,39 +37,57 @@ class Net(nn.Module):
         # окончательный слой предсказаний
         return self.f2(x)
 
-# создание модели и оптимизатора
-net = Net().to(device)
-opt = torch.optim.Adam(net.parameters(), lr=LR)
+if __name__ == "__main__":
+    # гиперпараметры обучения
+    BATCH, EPOCHS, LR = 128, 3, 1e-3
+    # выбираем GPU при наличии, иначе CPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# функция подсчёта точности на заданном наборе данных
-def accuracy(loader):
-    net.eval()  # режим оценки отключает Dropout
-    correct = total = 0
-    with torch.no_grad():  # без вычисления градиентов
-        for x,y in loader:  # проходим по батчам
-            x,y = x.to(device), y.to(device)  # перенос на устройство
-            logits = net(x)  # прямой проход
-            pred = logits.argmax(1)  # предсказанный класс
-            correct += (pred==y).sum().item()  # накопление правильных ответов
-            total   += y.size(0)  # общее количество примеров
-    return correct/total
+    # преобразование: в тензор и нормализация по среднему/стандартному отклонению
+    tfm = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,)),
+    ])
+    # загрузка обучающего и тестового набора
+    train = datasets.MNIST(root="./data", train=True, transform=tfm, download=True)
+    test = datasets.MNIST(root="./data", train=False, transform=tfm, download=True)
+    # обёртывание наборов в DataLoader для итерирования по мини-батчам
+    tr = DataLoader(train, batch_size=BATCH, shuffle=True, num_workers=0, pin_memory=True)
+    te = DataLoader(test, batch_size=BATCH, shuffle=False, num_workers=0, pin_memory=True)
 
-# основной цикл обучения
-for e in range(1, EPOCHS+1):
-    net.train()  # режим обучения
-    for x,y in tr:  # перебор батчей
-        x,y = x.to(device), y.to(device)  # перенос данных
-        opt.zero_grad()  # обнуление градиентов
-        loss = F.cross_entropy(net(x), y)  # вычисление функции потерь
-        loss.backward()  # обратное распространение
-        opt.step()  # обновление параметров
-    # выводим точность на тесте после эпохи
-    print(f"Эпоха {e}: точность={accuracy(te):.4f}")
+    # создание модели и оптимизатора
+    net = Net().to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=LR)
 
-# пример инференса для одного изображения из теста:
-x,y = test[0]  # берём первый тестовый пример
-with torch.no_grad():  # отключаем градиенты
-    p = net(x.unsqueeze(0).to(device)).argmax(1).item()  # получаем предсказание модели
-print("Предсказано:", p, "Правильный ответ:", y)
-# сохраняем веса модели на диск
-torch.save(net.state_dict(), "mnist_cnn.pt")
+    # функция подсчёта точности на заданном наборе данных
+    def accuracy(loader):
+        net.eval()  # режим оценки отключает Dropout
+        correct = total = 0
+        with torch.no_grad():  # без вычисления градиентов
+            for x, y in loader:  # проходим по батчам
+                x, y = x.to(device), y.to(device)  # перенос на устройство
+                logits = net(x)  # прямой проход
+                pred = logits.argmax(1)  # предсказанный класс
+                correct += (pred == y).sum().item()  # накопление правильных ответов
+                total += y.size(0)  # общее количество примеров
+        return correct / total
+
+    # основной цикл обучения
+    for e in range(1, EPOCHS + 1):
+        net.train()  # режим обучения
+        for x, y in tr:  # перебор батчей
+            x, y = x.to(device), y.to(device)  # перенос данных
+            opt.zero_grad()  # обнуление градиентов
+            loss = F.cross_entropy(net(x), y)  # вычисление функции потерь
+            loss.backward()  # обратное распространение
+            opt.step()  # обновление параметров
+        # выводим точность на тесте после эпохи
+        print(f"Эпоха {e}: точность={accuracy(te):.4f}")
+
+    # пример инференса для одного изображения из теста:
+    x, y = test[0]  # берём первый тестовый пример
+    with torch.no_grad():  # отключаем градиенты
+        p = net(x.unsqueeze(0).to(device)).argmax(1).item()  # получаем предсказание модели
+    print("Предсказано:", p, "Правильный ответ:", y)
+    # сохраняем веса модели на диск
+    torch.save(net.state_dict(), "mnist_cnn.pt")
