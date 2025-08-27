@@ -11,14 +11,16 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.pyplot import title
 from numpy.linalg import eigh
 from tqdm import tqdm
 
 # Константы конфигурации
 MEMORY_FILE = "mnist_memory.npz"
 DIGIT_COLORS = {0: "red", 1: "blue"}
+# DIGIT_COLORS = {6: "green", 9: "yellow"}
 LIMIT = None  # установите None, чтобы брать все коды для каждой цифры
-OUT_LAYOUT_PATH = "cosine_layout.png"
+OUT_LAYOUT_PATH = "cosine_layout"
 POINT_SIZE = 1  # размер маркера точки при визуализации
 
 
@@ -66,26 +68,22 @@ def main():
     codes = np.concatenate(sel_codes, axis=0)
     labels = np.concatenate(sel_labels, axis=0)
 
-    with tqdm(total=3, desc="Создание раскладки") as pbar:
-        mat = pairwise_cosine(codes)
-        pbar.update(1)
+    mat = pairwise_cosine(codes)
+    coords = classical_mds(mat)
 
-        coords = classical_mds(mat)
-        pbar.update(1)
-
-        fig, ax = plt.subplots(figsize=(6, 6))
-        for digit, color in DIGIT_COLORS.items():
-            mask = labels == digit
-            ax.scatter(coords[mask, 0], coords[mask, 1], c=color, s=POINT_SIZE, label=str(digit))
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_aspect('equal', 'datalim')
-        ax.legend(title="digit")
-        ax.set_title("Раскладка по косинусному расстоянию")
-        fig.tight_layout()
-        fig.savefig(OUT_LAYOUT_PATH, dpi=150)
-        pbar.update(1)
-    print(f"Сохранено в {OUT_LAYOUT_PATH}")
+    fig, ax = plt.subplots(figsize=(6, 6))
+    for digit, color in DIGIT_COLORS.items():
+        mask = labels == digit
+        ax.scatter(coords[mask, 0], coords[mask, 1], c=color, s=POINT_SIZE, label=str(digit))
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_aspect('equal', 'datalim')
+    ax.legend(title="digit")
+    ax.set_title("Korvin approach")
+    fig.tight_layout()
+    file_name = "-".join([OUT_LAYOUT_PATH, *map(str, DIGIT_COLORS)]) + ".png"
+    fig.savefig(file_name, dpi=150)
+    print(f"Сохранено в {file_name}")
 
 
 if __name__ == "__main__":
