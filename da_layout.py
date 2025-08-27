@@ -15,6 +15,7 @@ import torch
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
 import umap
+from sklearn.decomposition import TruncatedSVD
 
 # Параметры конфигурации из мета-файла
 META_JSON = "mnist_memory.meta.json"
@@ -109,6 +110,8 @@ def main() -> None:
     digits = list(DIGIT_COLORS.keys())
     codes, labels = extract_codes(digits)
     bits = codes_to_bits(codes)
+    svd = TruncatedSVD(n_components=256, random_state=SEED)
+    bits = svd.fit_transform(bits)
     umap_model = umap.UMAP(n_components=2, metric="cosine", random_state=SEED)
     coords = umap_model.fit_transform(bits)
 
