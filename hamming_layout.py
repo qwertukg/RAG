@@ -13,6 +13,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from numpy.linalg import eigh
+from tqdm import tqdm
 
 
 # Константы конфигурации
@@ -67,19 +68,26 @@ def main():
     codes = np.concatenate(sel_codes, axis=0)
     labels = np.concatenate(sel_labels, axis=0)
 
-    mat = pairwise_hamming(codes)
+    with tqdm(total=3, desc="Создание раскладки") as pbar:
+        mat = pairwise_hamming(codes)
+        pbar.update(1)
 
-    # ---- 2D-раскладка по расстояниям ----
-    coords = classical_mds(mat)
-    fig, ax = plt.subplots(figsize=(6, 6))
-    for digit, color in DIGIT_COLORS.items():
-        mask = labels == digit
-        ax.scatter(coords[mask, 0], coords[mask, 1], c=color, s=POINT_SIZE, label=str(digit))
-    ax.set_xticks([]); ax.set_yticks([])
-    ax.set_aspect('equal', 'datalim')
-    ax.legend(title="digit")
-    fig.tight_layout()
-    fig.savefig(OUT_LAYOUT_PATH, dpi=150)
+        # ---- 2D-раскладка по расстояниям ----
+        coords = classical_mds(mat)
+        pbar.update(1)
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        for digit, color in DIGIT_COLORS.items():
+            mask = labels == digit
+            ax.scatter(coords[mask, 0], coords[mask, 1], c=color, s=POINT_SIZE, label=str(digit))
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_aspect('equal', 'datalim')
+        ax.legend(title="digit")
+        ax.set_title("Раскладка по расстоянию Хэмминга")
+        fig.tight_layout()
+        fig.savefig(OUT_LAYOUT_PATH, dpi=150)
+        pbar.update(1)
     print(f"Сохранено в {OUT_LAYOUT_PATH}")
 
 
