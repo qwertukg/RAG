@@ -4,8 +4,8 @@
 Визуализация косинусных расстояний между кодами, полученными методом main_da.
 
 Берёт изображения указанных цифр из набора MNIST, кодирует их по правилам
-approach main_da и строит 2D-раскладку методом классического MDS по
-косинусным расстояниям. Точки раскрашиваются по цифрам.
+approach main_da и строит 2D-раскладку методом UMAP по косинусному
+расстоянию. Точки раскрашиваются по цифрам.
 Все параметры задаются константами ниже, CLI не поддерживается.
 """
 
@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
-from numpy.linalg import eigh
+import umap
 
 # Константы конфигурации
 GRID = 7
@@ -91,32 +91,19 @@ def extract_codes(digits) -> tuple[np.ndarray, np.ndarray]:
     return np.stack(codes), np.array(labels, dtype=np.int16)
 
 
-def pairwise_cosine(codes: np.ndarray) -> np.ndarray:
-    bits = np.unpackbits(
+def codes_to_bits(codes: np.ndarray) -> np.ndarray:
+    """Преобразует набор кодов в массив бит для последующей обработки."""
+    return np.unpackbits(
         codes.view(np.uint8).reshape(len(codes), -1), axis=1
     ).astype(np.float32)
-    norms = np.linalg.norm(bits, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    sim = bits @ bits.T / (norms * norms.T)
-    return 1.0 - sim
-
-
-def classical_mds(dist: np.ndarray, n_components: int = 2) -> np.ndarray:
-    n = dist.shape[0]
-    H = np.eye(n) - np.ones((n, n)) / n
-    B = -0.5 * H @ (dist ** 2) @ H
-    evals, evecs = eigh(B)
-    idx = np.argsort(evals)[::-1]
-    evals, evecs = evals[idx], evecs[:, idx]
-    w = np.maximum(evals[:n_components], 0)
-    return evecs[:, :n_components] * np.sqrt(w)
 
 
 def main() -> None:
     digits = list(DIGIT_COLORS.keys())
     codes, labels = extract_codes(digits)
-    dist = pairwise_cosine(codes)
-    coords = classical_mds(dist)
+    bits = codes_to_bits(codes)
+    umap_model = umap.UMAP(n_components=2, metric="cosine", random_state=SEED)
+    coords = umap_model.fit_transform(bits)
 
     fig, ax = plt.subplots(figsize=(6, 6))
     for digit, color in DIGIT_COLORS.items():
@@ -126,7 +113,7 @@ def main() -> None:
     ax.set_yticks([])
     ax.set_aspect("equal", "datalim")
     ax.legend(title="digit")
-    ax.set_title("DA codes cosine MDS")
+    ax.set_title("DA codes cosine UMAP")
     fig.tight_layout()
     fig.savefig(OUT_LAYOUT_PATH, dpi=150)
     print(f"Сохранено в {OUT_LAYOUT_PATH}")
