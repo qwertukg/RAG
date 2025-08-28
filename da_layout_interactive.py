@@ -72,19 +72,20 @@ def plot_interactive(coords: np.ndarray, labels: np.ndarray) -> None:
     ax.set_yticks([])
     ax.set_aspect("equal", "datalim")
     ax.set_title("Korvin approach UMAP")
+    ax.set_facecolor("black")
 
-    def update_legend():
-        visible = [(d, sc) for d, sc in scatters.items() if sc.get_visible()]
-        handles = [sc for _, sc in visible]
-        labels = [str(d) for d, _ in visible]
-        if handles:
-            ax.legend(handles, labels, title="digit")
-        else:
-            legend = ax.get_legend()
-            if legend is not None:
-                legend.remove()
+    def refresh_legend():
+        handles = []
+        labels = []
+        for d, sc in scatters.items():
+            label = f"[{d}]" if sc.get_visible() else f"{d}"
+            sc.set_label(label)
+            handles.append(sc)
+            labels.append(label)
+        ax.legend(handles, labels, title="digit")
 
-    update_legend()
+
+    refresh_legend()
 
     def on_key(event):
         if event.key and event.key.isdigit():
@@ -92,7 +93,7 @@ def plot_interactive(coords: np.ndarray, labels: np.ndarray) -> None:
             if d in scatters:
                 sc = scatters[d]
                 sc.set_visible(not sc.get_visible())
-                update_legend()
+                refresh_legend()
                 fig.canvas.draw_idle()
 
     fig.canvas.mpl_connect('key_press_event', on_key)

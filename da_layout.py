@@ -45,7 +45,7 @@ DIGIT_COLORS = colors = {
 
 LIMIT = None  # установите None, чтобы брать все изображения каждой цифры
 OUT_LAYOUT_PATH = "da_layout.png"
-POINT_SIZE = 10  # размер маркера точки при визуализации
+POINT_SIZE = 1  # размер маркера точки при визуализации
 
 
 rng = np.random.default_rng(SEED)
