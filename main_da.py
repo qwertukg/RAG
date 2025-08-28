@@ -1,164 +1,200 @@
-# mnist_sparse_bit_vectors.py
+# mnist_discrete_exact_parallel.py
 # Требует: numpy, torchvision, tqdm
+# Строго по статье: 28x28 -> 7x7 avgpool; популяционное кодирование уровней;
+# конкатенация 49 блоков по 128 бит; метрика Жаккара; k-NN (мажоритарное голосование).
+# Параллелизация: этап тестирования выполняется в ThreadPoolExecutor.
+
+import os
+# (необязательно) ограничим внутренние потоки BLAS/Accelerate для лучшего масштабирования потоков
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+from concurrent.futures import ThreadPoolExecutor
 from torchvision import datasets
 from torchvision.transforms import ToTensor
 from tqdm import tqdm
 import numpy as np, json
 
-# ------------------ Параметры (глава 2) ------------------
-GRID = 7                # 28x28 -> 7x7 (пуллинг усреднением)
-LEVELS = 4              # кванты яркости: 0..LEVELS (0 = "пусто")
-BITS_PER_CELL = 128     # длина бит-вектора для одной ячейки (конкатенация по всем ячейкам)
-K_BITS_PER_LEVEL = 16    # число единиц в коде уровня (constant-weight)
-KNN_K = 7               # число соседей для fuzzy-поиска (§2.2.5)
-TRAIN_LIMIT = None      # можно поставить 20000 для ускорения
+# ------------------ Параметры (строго по статье) ------------------
+GRID = 7                 # 28x28 -> 7x7 (усреднение 4x4)
+LEVELS = 4               # уровни яркости: 0..LEVELS (0 = пустой код)
+BITS_PER_CELL = 128      # длина кода на ячейку (2 * uint64)
+K_BITS_PER_LEVEL = 16    # постоянный вес кода уровня
+KNN_K = 7                # число соседей для k-NN (§2.2.5)
+TRAIN_LIMIT = None       # можно ограничить, напр., 20000
 SEED = 42
+
+DATA_DIR = "./data"
+OUT_NPZ  = "mnist_discrete_exact_memory.npz"
+OUT_META = "mnist_discrete_exact.meta.json"
 
 rng = np.random.default_rng(SEED)
 
-# ------------------ Кодовые книги (population coding, §2.0.1) ------------------
-# Для уровней 1..LEVELS задаём разрежённые коды длиной BITS_PER_CELL и весом K_BITS_PER_LEVEL.
-# Уровень 0 — нулевой код.
-def const_weight_u64(bits=64, k=6):
-    assert bits <= 64, "для простоты используем 64 бита на ячейку"
-    idx = rng.choice(bits, size=k, replace=False)
-    val = 0
-    for i in idx: val |= (1 << i)
-    return np.uint64(val)
+# Глобальные контейнеры, которые наполним в main (удобно для потоков)
+train_codes = None      # shape (N, 49, 2) uint64
+train_labels = None     # shape (N,)
+train_pop = None        # shape (N,)
+test_imgs = None        # shape (T, 28, 28) float32
+test_lbls = None        # shape (T,)
 
-def const_weight_128(bits=128, k=6):
-    assert bits % 64 == 0 and bits >= 64
-    words = bits // 64
-    idx = rng.choice(bits, size=k, replace=False)
-    val = np.zeros(words, dtype=np.uint64)
-    for i in idx:
-        w = i // 64
-        b = i % 64
-        val[w] |= (np.uint64(1) << np.uint64(b))
-    return val
+# ------------------ Кодовые книги (§2.0.1) ------------------
+def const_weight_indices(bits: int, k: int) -> np.ndarray:
+    idx = rng.choice(bits, size=k, replace=False).astype(np.int32)
+    return np.sort(idx)
 
-LEVEL_CODE = [np.zeros(2, dtype=np.uint64)] + [const_weight_128(BITS_PER_CELL, K_BITS_PER_LEVEL) for _ in range(LEVELS)]
+def idx_to_u64_pair(idx: np.ndarray) -> np.ndarray:
+    w = np.zeros((2,), dtype=np.uint64)  # 2*64 = 128 бит
+    for b in idx:
+        if b < 64:
+            w[0] |= (np.uint64(1) << np.uint64(b))
+        else:
+            w[1] |= (np.uint64(1) << np.uint64(b - 64))
+    return w
 
-# ------------------ Вспомогательные функции ------------------
-def avgpool_28_to_7(x28):
-    # x28: (28,28) float32 [0..1] -> (7,7) средние блоков 4x4
+# Уровень 0 — нулевой код; 1..LEVELS — const-weight коды на 128 бит
+LEVEL_CODE_IDX = [np.empty((0,), dtype=np.int32)] + [
+    const_weight_indices(BITS_PER_CELL, K_BITS_PER_LEVEL) for _ in range(LEVELS)
+]
+LEVEL_CODE = [np.zeros(2, dtype=np.uint64)] + [idx_to_u64_pair(i) for i in LEVEL_CODE_IDX[1:]]
+
+# ------------------ Базовые функции ------------------
+def avgpool_28_to_7(x28: np.ndarray) -> np.ndarray:
+    # x28: (28,28) float32 [0..1] -> (7,7) средние по блокам 4x4
     return x28.reshape(GRID, 28//GRID, GRID, 28//GRID).mean(axis=(1,3))
 
-def quantize_levels(x7):
-    # квантование в 0..LEVELS
+def quantize_levels(x7: np.ndarray) -> np.ndarray:
+    # [0..1] -> {0..LEVELS}
     q = np.floor(x7 * LEVELS).astype(np.int32)
     q[q > LEVELS] = LEVELS
+    q[q < 0] = 0
     return q
 
-def encode_image(img28):
+def encode_image(img28: np.ndarray) -> np.ndarray:
     """
-    Код изображения: конкатенация 49 блоков по 128 бит (два uint64).
-    Каждый блок = код уровня яркости ячейки (OR из §2.2.1, но у нас один уровень -> просто код уровня).
-    Конкатенация блоков по §2.2.3.
+    §2.2.3 Конкатенация 49 блоков по 128 бит (два uint64) в порядке row-major.
+    Внутри блока: §2.0.1 код уровня фиксированной длины и веса; §2.2.1 объединение (OR)
+    тривиально (один признак — яркостной уровень).
     Возврат: np.ndarray shape (GRID*GRID, 2) dtype=uint64
     """
-    x7 = avgpool_28_to_7(img28)              # (7,7)
-    q = quantize_levels(x7)                  # (7,7) в [0..LEVELS]
+    x7 = avgpool_28_to_7(img28)        # (7,7)
+    q  = quantize_levels(x7)           # (7,7) -> [0..LEVELS]
     code = np.empty((GRID*GRID, 2), dtype=np.uint64)
     t = 0
     for r in range(GRID):
         for c in range(GRID):
             lvl = int(q[r, c])
-            code[t] = LEVEL_CODE[lvl]        # уровень 0 -> 0, иначе sparse-блок
+            code[t] = LEVEL_CODE[lvl]
             t += 1
     return code
 
-# Быстрый popcount по uint64 массиву
-def popcount_u64(arr_u64):
-    # arr_u64: (...,) uint64 -> (...,) int32, число установленных битов в каждом слове
-    # Реализация через unpackbits по байтам
+def popcount_u64(arr_u64: np.ndarray) -> np.ndarray:
+    # Быстрый popcount: смотрим как на байтовый массив и unpackbits
     v = arr_u64.view(np.uint8)
     return np.unpackbits(v, axis=-1).sum(axis=-1, dtype=np.int32)
 
-def jaccard_blocks(query_blocks, base_blocks, base_popcnt=None):
+def jaccard_blocks(query_blocks: np.ndarray, base_blocks: np.ndarray,
+                   base_popcnt: np.ndarray | None = None) -> np.ndarray:
     """
-    Жаккар для конкатенированной битовой записи (§2.2.4.2):
-        J = |A∧B| / |A∨B|.
+    §2.2.4.2 Жаккар на конкатенированном коде: J = |A∧B| / |A∨B|
     query_blocks: (B,2) uint64
     base_blocks:  (N,B,2) uint64
-    base_popcnt:  (N,) int32 — precompute |B| если есть
+    base_popcnt:  (N,) int32 (предрасчёт |B|)
     """
-    # |A|, |B|
     qa = popcount_u64(query_blocks).sum(dtype=np.int32)
     if base_popcnt is None:
         bb = popcount_u64(base_blocks).reshape(base_blocks.shape[0], -1).sum(axis=1, dtype=np.int32)
     else:
         bb = base_popcnt
-
-    # |A∧B|
-    inter_blocks = np.bitwise_and(base_blocks, query_blocks)
+    inter_blocks = np.bitwise_and(base_blocks, query_blocks)    # (N,B,2)
     inter = popcount_u64(inter_blocks).reshape(base_blocks.shape[0], -1).sum(axis=1, dtype=np.int32)
-
-    # |A∨B| = |A| + |B| - |A∧B|
     union = qa + bb - inter
-    # Во избежание 0/0
     union = np.maximum(union, 1)
     return inter / union
 
-# ------------------ Загрузка данных ------------------
-train_ds = datasets.MNIST("./data", train=True,  transform=ToTensor(), download=True)
-test_ds  = datasets.MNIST("./data", train=False, transform=ToTensor(), download=True)
-
-if TRAIN_LIMIT is None: TRAIN_LIMIT = len(train_ds)
-
-# ------------------ Кодирование памяти (memory, для fuzzy-поиска §2.2.5) ------------------
-N = TRAIN_LIMIT
-B = GRID * GRID
-train_codes = np.empty((N, B, 2), dtype=np.uint64)
-train_labels = np.empty((N,), dtype=np.int16)
-
-for i in tqdm(range(N), desc="Кодирую train"):
-    img, y = train_ds[i]
-    img28 = img.squeeze(0).numpy()
-    train_codes[i] = encode_image(img28)
-    train_labels[i] = y
-
-# Предрассчитываем |B| (плотность) для ускорения Жаккара
-train_pop = popcount_u64(train_codes).reshape(N, -1).sum(axis=1, dtype=np.int32)
-
-# ------------------ Оценка на тесте через k-NN (fuzzy-поиск §2.2.5) ------------------
-def predict_label(code):
-    sims = jaccard_blocks(code, train_codes, base_popcnt=train_pop)
+def predict_label(code_blocks: np.ndarray) -> int:
+    sims = jaccard_blocks(code_blocks, train_codes, base_popcnt=train_pop)  # (N,)
     # top-k
     idx = np.argpartition(sims, -KNN_K)[-KNN_K:]
     neigh = train_labels[idx]
-    # мажоритарное голосование
-    # при равенстве — берём класс самого близкого
     vals, counts = np.unique(neigh, return_counts=True)
     y = vals[np.argmax(counts)]
+    # разрулим ничью: берём метку ближайшего по sim
+    if np.sum(counts == counts.max()) > 1:
+        y = train_labels[idx[np.argmax(sims[idx])]]
     return int(y)
 
-correct = total = 0
-for i in tqdm(range(len(test_ds)), desc="Тестирую"):
-    img, y = test_ds[i]
-    code = encode_image(img.squeeze(0).numpy())
-    pred = predict_label(code)
-    correct += (pred == y)
-    total += 1
+# Рабочая функция для параллельного теста (потоки видят общую память)
+def _predict_one(i: int) -> int:
+    code = encode_image(test_imgs[i])   # (49,2) uint64
+    return predict_label(code)
 
-print(f"Accuracy (kNN+Jaccard): {correct/total:.4f}")
+# ------------------ Main ------------------
+if __name__ == "__main__":
+    # --- данные
+    os.makedirs(DATA_DIR, exist_ok=True)
+    train_ds = datasets.MNIST(DATA_DIR, train=True,  transform=ToTensor(), download=True)
+    test_ds  = datasets.MNIST(DATA_DIR, train=False, transform=ToTensor(), download=True)
 
-# --- сохранить
-np.savez_compressed(
-    "mnist_memory.npz",
-    train_codes=train_codes,
-    train_labels=train_labels,
-    train_pop=train_pop,
-    LEVEL_CODE=np.array(LEVEL_CODE, dtype=np.uint64),
-)
-with open("mnist_memory.meta.json","w", encoding="utf-8") as f:
-    json.dump({
-        "GRID": GRID,
-        "LEVELS": LEVELS,
-        "BITS_PER_CELL": BITS_PER_CELL,
-        "K_BITS_PER_LEVEL": K_BITS_PER_LEVEL,
-        "KNN_K": KNN_K,
-        "SEED": SEED,
-        "block_order": "row-major (t=r*GRID+c)",
-        "dtype": "2xuint64 per block, 49 blocks per image"
-    }, f, ensure_ascii=False, indent=2)
+    if TRAIN_LIMIT is None:
+        TRAIN_LIMIT = len(train_ds)
+
+    # --- кодирование train
+    N = TRAIN_LIMIT
+    B = GRID * GRID
+    train_codes = np.empty((N, B, 2), dtype=np.uint64)
+    train_labels = np.empty((N,), dtype=np.int16)
+
+    for i in tqdm(range(N), desc="Кодирую train"):
+        img, y = train_ds[i]
+        img28 = img.squeeze(0).numpy()
+        train_codes[i]  = encode_image(img28)
+        train_labels[i] = int(y)
+
+    # --- предрасчёт |B| для ускорения Жаккара
+    train_pop = popcount_u64(train_codes).reshape(N, -1).sum(axis=1, dtype=np.int32)
+
+    # --- подготовим тест в NumPy (чтобы не гонять датасет внутри потоков)
+    T = len(test_ds)
+    test_imgs = np.empty((T, 28, 28), dtype=np.float32)
+    test_lbls = np.empty((T,), dtype=np.int16)
+    for i in tqdm(range(T), desc="Готовлю test"):
+        img, y = test_ds[i]
+        test_imgs[i] = img.squeeze(0).numpy()
+        test_lbls[i] = int(y)
+
+    # --- параллельный тест
+    workers = min(os.cpu_count() or 8, 12)  # на M2 Pro обычно 8–12 потоков нормально
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        preds = list(tqdm(ex.map(_predict_one, range(T), chunksize=128),
+                          total=T, desc="Параллельно тестирую"))
+    preds = np.asarray(preds, dtype=np.int16)
+    acc = (preds == test_lbls).mean()
+    print(f"Accuracy (kNN + Jaccard, параллельно): {acc:.4f}")
+
+    # --- сохранить артефакты
+    np.savez_compressed(
+        OUT_NPZ,
+        train_codes=train_codes,
+        train_labels=train_labels,
+        train_pop=train_pop,
+        LEVEL_CODE=np.array(LEVEL_CODE, dtype=np.uint64),
+    )
+    with open(OUT_META, "w", encoding="utf-8") as f:
+        json.dump({
+            "GRID": GRID,
+            "LEVELS": LEVELS,
+            "BITS_PER_CELL": BITS_PER_CELL,
+            "K_BITS_PER_LEVEL": K_BITS_PER_LEVEL,
+            "KNN_K": KNN_K,
+            "SEED": SEED,
+            "block_order": "row-major (t = r*GRID + c)",
+            "code_per_cell": "2xuint64 (128 bits)",
+            "metric": "Jaccard on concatenated blocks",
+            "search": "k-NN (majority vote) без весов",
+            "parallel_eval": {
+                "executor": "ThreadPoolExecutor",
+                "workers": workers,
+                "chunksize": 128
+            }
+        }, f, ensure_ascii=False, indent=2)
+    print(f"[Saved] {OUT_NPZ}, {OUT_META}")
