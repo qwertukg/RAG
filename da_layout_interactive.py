@@ -71,18 +71,37 @@ def plot_interactive(coords: np.ndarray, labels: np.ndarray) -> None:
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_aspect("equal", "datalim")
-    ax.legend(title="digit")
+    legend = ax.legend(title="digit")
     ax.set_title("Korvin approach UMAP")
+
+    legend_handles = {}
+    for handle, digit in zip(legend.legendHandles, DIGIT_COLORS.keys()):
+        handle.set_picker(True)
+        handle.set_alpha(1.0)
+        legend_handles[digit] = handle
+
+    handle_to_digit = {h: d for d, h in legend_handles.items()}
+
+    def toggle_digit(d):
+        sc = scatters[d]
+        visible = not sc.get_visible()
+        sc.set_visible(visible)
+        legend_handles[d].set_alpha(1.0 if visible else 0.2)
+        fig.canvas.draw_idle()
 
     def on_key(event):
         if event.key and event.key.isdigit():
             d = int(event.key)
             if d in scatters:
-                sc = scatters[d]
-                sc.set_visible(not sc.get_visible())
-                fig.canvas.draw_idle()
+                toggle_digit(d)
+
+    def on_pick(event):
+        handle = event.artist
+        if handle in handle_to_digit:
+            toggle_digit(handle_to_digit[handle])
 
     fig.canvas.mpl_connect('key_press_event', on_key)
+    fig.canvas.mpl_connect('pick_event', on_pick)
     plt.show()
 
 
