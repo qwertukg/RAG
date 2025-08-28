@@ -27,7 +27,8 @@ BITS_PER_CELL = int(meta["BITS_PER_CELL"])
 K_BITS_PER_LEVEL = int(meta["K_BITS_PER_LEVEL"])
 SEED = int(meta["SEED"])
 
-DIGIT_COLORS = {6: "green", 9: "yellow"}
+# DIGIT_COLORS = {6: "green", 9: "yellow"}
+DIGIT_COLORS = {7: "red", 1: "blue"}
 LIMIT = None  # установите None, чтобы брать все изображения каждой цифры
 OUT_LAYOUT_PATH = "da_mds_layout.png"
 POINT_SIZE = 1  # размер маркера точки при визуализации

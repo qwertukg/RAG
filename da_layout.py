@@ -27,9 +27,21 @@ BITS_PER_CELL = int(meta["BITS_PER_CELL"])
 K_BITS_PER_LEVEL = int(meta["K_BITS_PER_LEVEL"])
 SEED = int(meta["SEED"])
 
-# DIGIT_COLORS = {0: "red", 1: "blue", 2: "green", 3: "yellow", 4: "orange", 5: "purple", 6: "pink", 7: "brown", 8: "gray", 9: "black"}
+DIGIT_COLORS = colors = {
+    0: '#ff0000',
+    # 1: '#ff8d00',
+    # 2: '#e3ff00',
+    # 3: '#56ff00',
+    # 4: '#00ff36',
+    5: '#00ffc3',
+    6: '#00adff',
+    # 7: '#0020ff',
+    8: '#6c00ff',
+    # 9: '#f900ff'
+}
 # DIGIT_COLORS = {0: "red", 1: "blue"}
-DIGIT_COLORS = {6: "green", 9: "yellow"}
+# DIGIT_COLORS = {0: "red", 8: "blue"}
+# DIGIT_COLORS = {6: "green", 9: "yellow"}
 
 LIMIT = None  # установите None, чтобы брать все изображения каждой цифры
 OUT_LAYOUT_PATH = "da_layout.png"
