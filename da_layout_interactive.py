@@ -8,11 +8,15 @@ individual digit overlays in real time by pressing the corresponding key
 (0-9).
 """
 
+import os
+
 import matplotlib.pyplot as plt
 import umap
 from sklearn.decomposition import TruncatedSVD
 import numpy as np
 import da_layout as base
+
+CACHE_PATH = "da_layout_interactive_cache.npz"
 
 DIGIT_COLORS = {
     0: '#ff0000',
@@ -29,7 +33,11 @@ DIGIT_COLORS = {
 
 
 def compute_layout():
-    """Compute 2D layout for all digits using DA encoding."""
+    """Compute or load cached 2D layout for all digits using DA encoding."""
+    if os.path.exists(CACHE_PATH):
+        data = np.load(CACHE_PATH)
+        return data["coords"], data["labels"]
+
     digits = list(DIGIT_COLORS.keys())
     codes, labels = base.extract_codes(digits)
     bits = base.codes_to_bits(codes)
@@ -37,6 +45,7 @@ def compute_layout():
     bits = svd.fit_transform(bits)
     umap_model = umap.UMAP(n_components=2, metric="cosine", random_state=base.SEED)
     coords = umap_model.fit_transform(bits)
+    np.savez(CACHE_PATH, coords=coords, labels=labels)
     return coords, labels
 
 
