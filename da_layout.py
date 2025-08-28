@@ -45,7 +45,7 @@ DIGIT_COLORS = colors = {
 
 LIMIT = None  # установите None, чтобы брать все изображения каждой цифры
 OUT_LAYOUT_PATH = "da_layout.png"
-POINT_SIZE = 1  # размер маркера точки при визуализации
+POINT_SIZE = 10  # размер маркера точки при визуализации
 
 
 rng = np.random.default_rng(SEED)
@@ -130,8 +130,17 @@ def main() -> None:
     fig, ax = plt.subplots(figsize=(6, 6))
     for digit, color in DIGIT_COLORS.items():
         mask = labels == digit
-        ax.scatter(coords[mask, 0], coords[mask, 1], c=color, s=POINT_SIZE, label=str(digit),
-                   marker=',', antialiased=True, linewidths=0, alpha=0.5)
+        ax.scatter(
+            coords[mask, 0],
+            coords[mask, 1],
+            c=color,
+            s=POINT_SIZE,
+            label=str(digit),
+                   marker=',',
+            antialiased=True,
+            linewidths=0,
+            alpha=0.5
+        )
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_aspect("equal", "datalim")
