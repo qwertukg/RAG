@@ -83,9 +83,25 @@ def plot_interactive(coords: np.ndarray, labels: np.ndarray) -> None:
             handles.append(sc)
             labels.append(label)
         ax.legend(handles, labels, title="digit")
+        ax.set_aspect("equal")
 
+
+    def autoscale():
+        """Adjust axes limits to fit currently visible digits."""
+        visible = [sc.get_offsets() for sc in scatters.values() if sc.get_visible()]
+        if not visible:
+            return
+        coords = np.vstack(visible)
+        x_min, y_min = coords.min(axis=0)
+        x_max, y_max = coords.max(axis=0)
+        pad_x = (x_max - x_min) * 0.05
+        pad_y = (y_max - y_min) * 0.05
+        ax.set_xlim(x_min - pad_x, x_max + pad_x)
+        ax.set_ylim(y_min - pad_y, y_max + pad_y)
+        ax.set_aspect("equal")
 
     refresh_legend()
+    autoscale()
 
     def on_key(event):
         if event.key and event.key.isdigit():
@@ -94,6 +110,7 @@ def plot_interactive(coords: np.ndarray, labels: np.ndarray) -> None:
                 sc = scatters[d]
                 sc.set_visible(not sc.get_visible())
                 refresh_legend()
+                autoscale()
                 fig.canvas.draw_idle()
 
     fig.canvas.mpl_connect('key_press_event', on_key)
