@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Interactive 3D visualization of DA layout with color toggling.
+"""Interactive 2D visualization of DA layout with color toggling.
 
 The layout is computed once from precomputed DA codes stored in
 ``mnist_full_discrete_pipeline_parallel.npz`` and can be interactively
@@ -9,7 +9,6 @@ explored with per-digit toggling (keys 0-9)."""
 import json
 import os
 from typing import Any
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -62,7 +61,7 @@ def codes_to_bits(codes: np.ndarray) -> np.ndarray:
 
 
 def compute_layout():
-    """Compute or load cached 3D layout for all digits."""
+    """Compute or load cached 2D layout for all digits."""
     if os.path.exists(CACHE_PATH):
         data = np.load(CACHE_PATH)
         return data["coords"], data["labels"]
@@ -88,7 +87,7 @@ def compute_layout():
 
     bits = codes_to_bits(codes)
 
-    umap_model = umap.UMAP(n_components=3, metric="cosine", random_state=SEED)
+    umap_model = umap.UMAP(n_components=2, metric="cosine", random_state=SEED)
     coords = umap_model.fit_transform(bits)
 
     np.savez(CACHE_PATH, coords=coords, labels=labels)
@@ -96,9 +95,9 @@ def compute_layout():
 
 
 def plot_interactive(coords: np.ndarray, labels: np.ndarray) -> None:
-    """Create an interactive 3D plot with digit overlays that can be toggled."""
+    """Create an interactive 2D plot with digit overlays that can be toggled."""
     fig = plt.figure(figsize=(6, 6))
-    ax = fig.add_subplot(111, projection="3d")
+    ax = fig.add_subplot(111)
     scatters: dict[int, Any] = {}
     digit_coords: dict[int, np.ndarray] = {}
     for digit, color in DIGIT_COLORS.items():
@@ -107,7 +106,6 @@ def plot_interactive(coords: np.ndarray, labels: np.ndarray) -> None:
         sc = ax.scatter(
             pts[:, 0],
             pts[:, 1],
-            pts[:, 2],
             c=color,
             s=POINT_SIZE,
             label=str(digit),
@@ -121,10 +119,9 @@ def plot_interactive(coords: np.ndarray, labels: np.ndarray) -> None:
 
     ax.set_xticks([])
     ax.set_yticks([])
-    ax.set_zticks([])
-    ax.set_title("3D UMAP (cosine) on raw DA bit codes")
+    ax.set_title("2D UMAP (cosine) on raw DA bit codes")
     ax.set_facecolor("black")
-    ax.set_box_aspect((1, 1, 1))
+    ax.set_aspect("equal")
 
     def refresh_legend():
         handles = []
@@ -135,7 +132,7 @@ def plot_interactive(coords: np.ndarray, labels: np.ndarray) -> None:
             handles.append(sc)
             labels_txt.append(label)
         ax.legend(handles, labels_txt, title="digit")
-        ax.set_box_aspect((1, 1, 1))
+        ax.set_aspect("equal")
 
     def autoscale():
         """Adjust axes limits to fit currently visible digits."""
@@ -143,15 +140,13 @@ def plot_interactive(coords: np.ndarray, labels: np.ndarray) -> None:
         if not visible:
             return
         pts = np.vstack(visible)
-        x_min, y_min, z_min = pts.min(axis=0)
-        x_max, y_max, z_max = pts.max(axis=0)
+        x_min, y_min = pts.min(axis=0)
+        x_max, y_max = pts.max(axis=0)
         pad_x = (x_max - x_min) * 0.05
         pad_y = (y_max - y_min) * 0.05
-        pad_z = (z_max - z_min) * 0.05
         ax.set_xlim(x_min - pad_x, x_max + pad_x)
         ax.set_ylim(y_min - pad_y, y_max + pad_y)
-        ax.set_zlim(z_min - pad_z, z_max + pad_z)
-        ax.set_box_aspect((1, 1, 1))
+        ax.set_aspect("equal")
 
     refresh_legend()
     autoscale()
