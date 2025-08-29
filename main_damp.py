@@ -255,28 +255,41 @@ class DAMPLayout:
 
     # --- Энергия пары (5.5) ---
     def _pair_energy(self, i1: int, i2: int, mode: str = "far") -> Tuple[float, float]:
-        """Возвращает (phi_c, phi_s) для пары индексов кодов i1,i2.
-        mode="far": φ = sum s*d (штраф далеких коррелированных)
-        mode="near": φ = sum s/d (поощрение близких коррелированных)
+        """Энергия пары (5.5) с корректным учётом *крестовых* окрестностей.
+        phi_c — энергия в текущих позициях; phi_s — если i1 и i2 поменять местами.
+        Для phi_s используем похожести i1 к окрестности i2 (idx2) и i2 к окрестности i1 (idx1),
+        чтобы длины векторов совпадали с соответствующими расстояниями D2 и D1.
         """
         self._ensure_sim()
         y1, x1 = self.coords_of(i1)
         y2, x2 = self.coords_of(i2)
         r = self.pair_radius if self.pair_radius > 0 else max(self.H, self.W)
+
+        # Локальные окна вокруг текущих позиций
         Y1, X1, D1 = self._local_window(y1, x1, r)
         Y2, X2, D2 = self._local_window(y2, x2, r)
         idx1 = self.grid_idx[Y1, X1].ravel()
         idx2 = self.grid_idx[Y2, X2].ravel()
-        s1 = sim_lambda(self._sim[i1, idx1], self.lam_far if mode=="far" else self.lam_near, self.eta)
-        s2 = sim_lambda(self._sim[i2, idx2], self.lam_far if mode=="far" else self.lam_near, self.eta)
+
+        lam = self.lam_far if mode == "far" else self.lam_near
+        # Похожести к своим окрестностям (для phi_c)
+        s1_self = sim_lambda(self._sim[i1, idx1], lam, self.eta)
+        s2_self = sim_lambda(self._sim[i2, idx2], lam, self.eta)
+        # Похожести к *чужим* окрестностям (для phi_s)
+        s1_cross = sim_lambda(self._sim[i1, idx2], lam, self.eta)  # длина == len(D2)
+        s2_cross = sim_lambda(self._sim[i2, idx1], lam, self.eta)  # длина == len(D1)
+
         D1 = np.maximum(D1.ravel(), 1e-6)
         D2 = np.maximum(D2.ravel(), 1e-6)
+
         if mode == "far":
-            phi_c = float((s1 * D1).sum() + (s2 * D2).sum())
-            phi_s = float((s2 * D1).sum() + (s1 * D2).sum())
+            # Штраф далёких коррелированных: суммируем s*d
+            phi_c = float((s1_self * D1).sum() + (s2_self * D2).sum())
+            phi_s = float((s1_cross * D2).sum() + (s2_cross * D1).sum())
         else:
-            phi_c = float((s1 / D1).sum() + (s2 / D2).sum())
-            phi_s = float((s2 / D1).sum() + (s1 / D2).sum())
+            # Поощрение близких коррелированных: суммируем s/d
+            phi_c = float((s1_self / D1).sum() + (s2_self / D2).sum())
+            phi_s = float((s1_cross / D2).sum() + (s2_cross / D1).sum())
         return phi_c, phi_s
 
     def _random_pairs(self, p: int) -> List[Tuple[int, int]]:
@@ -422,14 +435,15 @@ class DetectorSpace:
 
     # --- построение пространства детекторов (6.4) ---
     def _cluster_points(self, A_loc: np.ndarray, mu_e: float, eps: float, min_samples: int) -> List[np.ndarray]:
-        """Выбрать активные точки с Ê>=μ_e и кластеризовать DBSCAN (6.4.1)."""
+        """Выбрать **активные** точки: Ê>=μ_e И A_loc>0, далее кластеризовать DBSCAN (6.4.1)."""
         H, W = A_loc.shape
-        Ys, Xs = np.where(self.E_norm >= mu_e)
+        mask = (self.E_norm >= mu_e) & (A_loc > 0)
+        Ys, Xs = np.where(mask)
         if Ys.size == 0:
             return []
         P = np.stack([Ys.astype(np.float32), Xs.astype(np.float32)], axis=1)
         labels = SimpleDBSCAN(eps=eps, min_samples=min_samples).fit_predict(P)
-        clusters = []
+        clusters: List[np.ndarray] = []
         for cid in sorted(set(labels.tolist())):
             if cid < 0:
                 continue
@@ -536,34 +550,62 @@ class DetectorSpace:
                     return
 
     # --- детектирование стимула и эмбеддинг (6.5) ---
-    def detect(self, stimuli_idx: Sequence[int], lam_a: float = 0.6, mu_e: float = 0.2,
-               energy_coeff: float = 0.0) -> Tuple[np.ndarray, List[int]]:
-        """Вернуть бинарный код активности детекторов и список сработавших детекторов.
-        A ≡ A^λ_a(S) — объединенная активация (6.5). Далее берём подмножество A_{μ_e}(d, A)
-        внутри рецептивного поля и вычисляем e_d = Σ a·Ê (6.3). Детектор активен, если:
-            e_d >= max(μ_e·n_d, q⋅E_ref), где q задаётся через energy_coeff (эвристич.)
-        Возвращает: (code[bits], active_indices).
+    def detect(
+            self,
+            stimuli_idx: Sequence[int],
+            lam_a: float = 0.6,
+            mu_e: float = 0.06,
+            mu_d: float = 0.12,
+    ) -> tuple[np.ndarray, list[int]]:
         """
-        A = self.activation(stimuli_idx, lam_a=lam_a)
+        Детектирование по документу (§6.3, §6.5).
+
+        A ≡ A^{λ_a}(S): объединённая активация от множества стимулов S.
+        Энергия детектора:
+            E(d, A) = (1 / e_d) * Σ_{(y,x) ∈ A^{μ_e}(d,A)}  a_{yx} * ê_{yx},
+        где A^{μ_e}(d,A) — точки внутри поля детектора (круг c центром c_d и радиусом r_d),
+        у которых нормированная точечная энергия ê_{yx} ≥ μ_e; e_d — энергия детектора,
+        зафиксированная при его создании. Детектор активен, если E(d,A) ≥ μ_d.
+        Возвращает: (бинарный код размера out_bits, список индексов сработавших детекторов).
+        """
+        # 1) Объединённая активация от стимулов
+        A = self.activation(stimuli_idx, lam_a=lam_a)  # shape (H, W), в [0,1]
+        E = self.E_norm  # shape (H, W), в [0,1]
+
+        H, W = self.layout.H, self.layout.W
         code = np.zeros((self.out_bits,), dtype=bool)
-        act_ids = []
-        # опорный уровень для адаптивного порога
-        E_ref = float((A * self.E_norm).mean())
+        active_ids: list[int] = []
+
         for i, d in enumerate(self.detectors):
-            y0 = int(max(0, math.floor(d.c[0]-d.r)))
-            y1 = int(min(self.layout.H, math.ceil(d.c[0]+d.r)+1))
-            x0 = int(max(0, math.floor(d.c[1]-d.r)))
-            x1 = int(min(self.layout.W, math.ceil(d.c[1]+d.r)+1))
+            # Рецептивное поле детектора (круг)
+            y0 = int(max(0, math.floor(d.c[0] - d.r)))
+            y1 = int(min(H, math.ceil(d.c[0] + d.r) + 1))
+            x0 = int(max(0, math.floor(d.c[1] - d.r)))
+            x1 = int(min(W, math.ceil(d.c[1] + d.r) + 1))
+
+            if y0 >= y1 or x0 >= x1:
+                continue
+
+            YY, XX = np.meshgrid(np.arange(y0, y1), np.arange(x0, x1), indexing="ij")
+            mask_circle = (YY - d.c[0]) ** 2 + (XX - d.c[1]) ** 2 <= (d.r * d.r)
+
+            # Фильтр A^{μ_e}(d, A): внутри поля и ê_{yx} ≥ μ_e
+            subE = E[y0:y1, x0:x1]
             subA = A[y0:y1, x0:x1]
-            subE = self.E_norm[y0:y1, x0:x1]
-            YY, XX = np.meshgrid(np.arange(y0,y1), np.arange(x0,x1), indexing='ij')
-            mask = ((YY - d.c[0])**2 + (XX - d.c[1])**2) <= (d.r*d.r)
-            e_d = float((subA[mask] * subE[mask]).sum())
-            thr = max(mu_e * d.n_points, energy_coeff * E_ref)
-            if e_d >= thr:
+            mask = mask_circle & (subE >= mu_e)
+            if not np.any(mask):
+                continue
+
+            # Нормированная энергия отклика детектора
+            num = float((subA[mask] * subE[mask]).sum())
+            den = float(d.energy) if d.energy > 0.0 else max(float(subE[mask].sum()), 1e-12)
+            s = num / max(den, 1e-12)  # E(d, A)
+
+            if s >= mu_d:
                 code[d.bit_index] = True
-                act_ids.append(i)
-        return code, act_ids
+                active_ids.append(i)
+
+        return code, active_ids
 
 
 # ============================
@@ -597,14 +639,36 @@ if __name__ == "__main__":
     V = codebook.sample_many(N)
 
     damp = DAMPLayout(codes=V, H=32, W=32, lam_far=0.6, lam_near=0.6, r_energy=6.0, pair_radius=8.0)
-    # В целях демо уменьшим количество шагов
-    damp.run(steps_far=2, steps_near=2, p_per_step=512)
+    # Для демонстрации чуть больше итераций, чтобы E_norm стала неравномерной
+    damp.run(steps_far=4, steps_near=4, p_per_step=1024)
 
     # 2) Построим один уровень детекторов
     space = DetectorSpace(layout=damp, out_bits=512)
-    space.build_level(lam_d=0.6, r_act=8.0, eps=1.5, min_samples=3, mu_e=0.10, attempts=30, max_detectors=64)
+    # Параметры помягче: ниже порог энергии μ_e и чуть более «свободный» DBSCAN
+    space.build_level(lam_d=0.6, r_act=8.0, eps=2.0, min_samples=3, mu_e=0.08, attempts=80, max_detectors=96)
 
-    # 3) Возьмём произвольный «стимул» — один из кодов — и получим детекторный код
-    stimulus_idx = [0]
-    code, act = space.detect(stimulus_idx, lam_a=0.6, mu_e=0.1, energy_coeff=0.0)
+    print("Detectors built:", len(space.detectors))
+
+    # 3) Попробуем активировать детекторы
+    stimulus_idx: List[int] = []
+    if space.detectors:
+        # Возьмём код, находящийся в центре первого детектора
+        cy, cx = space.detectors[0].c
+        iy = int(round(min(max(cy, 0), damp.H - 1)))
+        ix = int(round(min(max(cx, 0), damp.W - 1)))
+        stimulus_idx = [int(damp.grid_idx[iy, ix])]
+    else:
+        # Если детекторов нет (не должно быть при выбранных параметрах) — возьмём произвольный код
+        stimulus_idx = [1]
+
+    # Детектирование: используем тот же λ, что при построении уровня, и мягкий порог μ_e
+    code, act = space.detect(stimuli_idx=stimulus_idx, lam_a=0.6, mu_e=0.06)
+
+    # Если всё ещё 0 — попробуем подобрать стимул по топ‑активации
+    if not act:
+        sims = damp._sim[stimulus_idx[0]] if space.detectors else damp._sim[0]
+        top = int(np.argmax(sims))
+        code, act = space.detect(stimuli_idx=[top], lam_a=0.6, mu_e=0.05)
+
+    print("Stimulus indices:", stimulus_idx)
     print("Active detectors:", len(act), "bits on:", int(code.sum()))
