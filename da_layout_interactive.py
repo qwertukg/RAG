@@ -15,6 +15,7 @@ import umap
 
 # переиспользуем функции и параметры из фиксированного скрипта
 import da_layout as base
+from main_da import mnist_range
 
 CACHE_PATH = "da_layout_interactive_cache.npz"
 
@@ -30,6 +31,7 @@ DIGIT_COLORS = {
     8: '#6c00ff',
     9: '#f900ff'
 }
+DIGIT_COLORS = {d: c for d, c in DIGIT_COLORS.items() if d in mnist_range}
 
 
 def compute_layout():
