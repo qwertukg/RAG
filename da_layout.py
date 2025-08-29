@@ -55,7 +55,7 @@ SEED = int(meta["SEED"])
 
 # LEVEL_CODE: форма (LEVELS+1, words_per_cell), dtype=uint64
 #  - уровень 0 — нулевой код
-LEVEL_CODE = np.load(NPZ_FILE)["LEVEL_CODE"]
+LEVEL_CODE = np.load(NPZ_FILE)["level_code"]
 WORDS_PER_CELL = LEVEL_CODE.shape[1]  # обычно 2 слова по 64 бита (итого 128 бит)
 
 rng = np.random.default_rng(SEED)
