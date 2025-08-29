@@ -8,7 +8,6 @@ os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import partial
 import numpy as np
 from tqdm import tqdm
 from torchvision import datasets
@@ -44,6 +43,8 @@ WORKERS = min(os.cpu_count() or 8, 12)
 CHUNK_ENCODE = 256
 CHUNK_TEST = 128
 CHUNK_CLASS = 128
+
+mnist_range = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
 
 rng = np.random.default_rng(SEED)
 
@@ -244,6 +245,9 @@ def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     train_ds = datasets.MNIST(DATA_DIR, train=True,  transform=ToTensor(), download=True)
     test_ds  = datasets.MNIST(DATA_DIR, train=False, transform=ToTensor(), download=True)
+
+    train_ds = [(img, label) for img, label in train_ds if label in mnist_range]
+    test_ds  = [(img, label) for img, label in test_ds if label in mnist_range]
 
     # снимем в numpy для эффективной сериализации между потоками
     if TRAIN_LIMIT is None:

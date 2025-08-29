@@ -22,24 +22,24 @@ import matplotlib.pyplot as plt
 import umap
 
 # ---- Файлы артефактов памяти (из main_da) ----
-META_JSON = "mnist_memory.meta.json"
-NPZ_FILE  = "mnist_memory.npz"
+META_JSON = "mnist_full_discrete_pipeline_parallel.meta.json"
+NPZ_FILE  = "mnist_full_discrete_pipeline_parallel.npz"
 
 # ---- Параметры визуализации ----
 DIGIT_COLORS = {
-    0: '#ff0000',
-    1: '#ff8d00',
-    2: '#e3ff00',
+    # 0: '#ff0000',
+    # 1: '#ff8d00',
+    # 2: '#e3ff00',
     3: '#56ff00',
-    4: '#00ff36',
-    5: '#00ffc3',
-    6: '#00adff',
-    7: '#0020ff',
-    8: '#6c00ff',
-    9: '#f900ff'
+    # 4: '#00ff36',
+    # 5: '#00ffc3',
+    # 6: '#00adff',
+    # 7: '#0020ff',
+    # 8: '#6c00ff',
+    # 9: '#f900ff'
 }
 LIMIT = None          # None = все доступные изображения каждой цифры; иначе берём первые LIMIT
-OUT_LAYOUT_PATH = "da_layout.png"
+OUT_LAYOUT_PATH = "da_layout3.png"
 POINT_SIZE = 1
 ALPHA = 0.5
 
@@ -161,7 +161,13 @@ def main() -> None:
         )
     ax.set_xticks([])
     ax.set_yticks([])
-    ax.set_aspect("equal", "datalim")
+    ax.set_facecolor("black")
+
+    ax.set_aspect("equal", "box")
+    s = 50
+    ax.set_xlim(-s, s)
+    ax.set_ylim(-s, s)
+
     ax.legend(title="digit", markerscale=8, frameon=True)
     ax.set_title("UMAP по косинусу над исходными бит-кодами (main_da)")
     fig.tight_layout()
