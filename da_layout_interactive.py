@@ -2,10 +2,9 @@
 # -*- coding: utf-8 -*-
 """Interactive visualization of DA layout with color toggling.
 
-This script precomputes the UMAP layout for all digits (0-9) using the
-same encoding as ``mnist_da_layout.py`` and allows enabling or disabling
-individual digit overlays in real time by pressing the corresponding key
-(0-9).
+The layout is computed once from precomputed DA codes stored in
+``mnist_full_discrete_pipeline_parallel.npz`` and can be interactively
+explored with per-digit toggling (keys 0-9).
 """
 
 import os
@@ -13,9 +12,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import umap
 
-# переиспользуем функции и параметры из фиксированного скрипта
+# reuse utility functions and constants from the static layout script
 import da_layout as base
-from main_da import mnist_range
 
 CACHE_PATH = "da_layout_interactive_cache.npz"
 
@@ -29,22 +27,37 @@ DIGIT_COLORS = {
     6: '#00adff',
     7: '#0020ff',
     8: '#6c00ff',
-    9: '#f900ff'
+    9: '#f900ff',
 }
-DIGIT_COLORS = {d: c for d, c in DIGIT_COLORS.items() if d in mnist_range}
 
 
 def compute_layout():
-    """Compute or load cached 2D layout for all digits using DA encoding."""
+    """Compute or load cached 2D layout for all digits."""
     if os.path.exists(CACHE_PATH):
         data = np.load(CACHE_PATH)
         return data["coords"], data["labels"]
 
     digits = list(DIGIT_COLORS.keys())
-    codes, labels = base.extract_codes(digits)   # кодируем ровно как в mnist_da_layout.py
-    bits = base.codes_to_bits(codes)             # плоские 0/1 без SVD
+    data = np.load(base.OUT_NPZ)
+    codes_all = data["train_codes"]
+    labels_all = data["train_labels"]
 
-    # UMAP по косинусной метрике на сырых битах
+    selected_codes = []
+    selected_labels = []
+    for d in digits:
+        idx = np.where(labels_all == d)[0]
+        if base.LIMIT is not None:
+            idx = idx[:base.LIMIT]
+        if idx.size == 0:
+            continue
+        selected_codes.append(codes_all[idx])
+        selected_labels.append(labels_all[idx])
+
+    codes = np.concatenate(selected_codes, axis=0)
+    labels = np.concatenate(selected_labels, axis=0)
+
+    bits = base.codes_to_bits(codes)
+
     umap_model = umap.UMAP(n_components=2, metric="cosine", random_state=base.SEED)
     coords = umap_model.fit_transform(bits)
 
