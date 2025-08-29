@@ -1,4 +1,4 @@
-# mnist_full_discrete_pipeline_parallel.py
+# main_da.py
 # Требует: Python 3.10+, numpy, torchvision, tqdm
 # Пайплайн полностью по статье (MNIST) + параллелизация там, где это безопасно.
 
