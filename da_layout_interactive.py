@@ -11,6 +11,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import umap
+from main_da import mnist_range
 
 # reuse utility functions and constants from the static layout script
 import da_layout as base
@@ -29,6 +30,7 @@ DIGIT_COLORS = {
     8: '#6c00ff',
     9: '#f900ff',
 }
+DIGIT_COLORS = {d: c for d, c in DIGIT_COLORS.items() if d in mnist_range}
 
 
 def compute_layout():
