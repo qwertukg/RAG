@@ -3,17 +3,17 @@
 """Interactive visualization of DA layout with color toggling.
 
 This script precomputes the UMAP layout for all digits (0-9) using the
-same encoding as ``da_layout.py`` and allows enabling or disabling
+same encoding as ``mnist_da_layout.py`` and allows enabling or disabling
 individual digit overlays in real time by pressing the corresponding key
 (0-9).
 """
 
 import os
-
+import numpy as np
 import matplotlib.pyplot as plt
 import umap
-from sklearn.decomposition import TruncatedSVD
-import numpy as np
+
+# переиспользуем функции и параметры из фиксированного скрипта
 import da_layout as base
 
 CACHE_PATH = "da_layout_interactive_cache.npz"
@@ -39,12 +39,13 @@ def compute_layout():
         return data["coords"], data["labels"]
 
     digits = list(DIGIT_COLORS.keys())
-    codes, labels = base.extract_codes(digits)
-    bits = base.codes_to_bits(codes)
-    svd = TruncatedSVD(n_components=256, random_state=base.SEED)
-    bits = svd.fit_transform(bits)
+    codes, labels = base.extract_codes(digits)   # кодируем ровно как в mnist_da_layout.py
+    bits = base.codes_to_bits(codes)             # плоские 0/1 без SVD
+
+    # UMAP по косинусной метрике на сырых битах
     umap_model = umap.UMAP(n_components=2, metric="cosine", random_state=base.SEED)
     coords = umap_model.fit_transform(bits)
+
     np.savez(CACHE_PATH, coords=coords, labels=labels)
     return coords, labels
 
@@ -71,29 +72,28 @@ def plot_interactive(coords: np.ndarray, labels: np.ndarray) -> None:
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_aspect("equal", "datalim")
-    ax.set_title("Korvin approach UMAP")
+    ax.set_title("UMAP (cosine) on raw DA bit codes")
     ax.set_facecolor("black")
 
     def refresh_legend():
         handles = []
-        labels = []
+        labels_txt = []
         for d, sc in scatters.items():
             label = f"[{d}]" if sc.get_visible() else f"{d}"
             sc.set_label(label)
             handles.append(sc)
-            labels.append(label)
-        ax.legend(handles, labels, title="digit")
+            labels_txt.append(label)
+        ax.legend(handles, labels_txt, title="digit")
         ax.set_aspect("equal")
-
 
     def autoscale():
         """Adjust axes limits to fit currently visible digits."""
         visible = [sc.get_offsets() for sc in scatters.values() if sc.get_visible()]
         if not visible:
             return
-        coords = np.vstack(visible)
-        x_min, y_min = coords.min(axis=0)
-        x_max, y_max = coords.max(axis=0)
+        pts = np.vstack(visible)
+        x_min, y_min = pts.min(axis=0)
+        x_max, y_max = pts.max(axis=0)
         pad_x = (x_max - x_min) * 0.05
         pad_y = (y_max - y_min) * 0.05
         ax.set_xlim(x_min - pad_x, x_max + pad_x)
