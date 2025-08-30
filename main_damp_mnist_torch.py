@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MNIST → DAMP (§5) → Детекторы (§6) — реализация на PyTorch (с поддержкой CUDA).
+MNIST → DAMP (§5) → Детекторы (§6) — реализация на PyTorch/CUDA (исправленная «фундаменталка»).
 
-Что изменено по сравнению с NumPy-версией:
-  • Все тяжёлые куски переведены на PyTorch, с расчётом попарных Жаккаров на GPU.
-  • Используются булевы коды (0/1) вместо битовой упаковки — это позволяет считать
-    пересечения через матричное умножение на GPU: inter = A @ B^T.
-  • DAMP хранит матрицу сходств на CPU (numpy), но строится из GPU-вычислений.
-  • Построение детекторов — строго «по документу»: A^λ(c) от ОДНОГО центра,
-    e_d — только по точкам с Ê≥μ_e в круге, запрет перекрытия центров на уровне,
-    при конфликте оставляем детектор с большим заполнением n/r. Случайный bit_index.
-  • Убрано всё неиспользуемое (kNN-бейзлайн, u64-утилиты и пр.).
-  • ДОБАВЛЕНЫ оптимизации и параллелизм (без изменения алгоритма):
-      – батчевое вычисление A для множества запросов на GPU (матрица Жаккара разом);
-      – предвычисленная матрица детектирования W (HW×K) на GPU для мгновенного вычисления E(d,A) в батче;
-      – двухфазная сборка детекторов: параллельная генерация кандидатов по сидингу + глобальное разрешение конфликтов «no-center-overlap, keep higher n/r»;
-      – кэширование геометрии кругов и масок по Ê на этапе детектирования;
-      – настройки батч‑размеров и потоков загрузки.
+Ключевые моменты и фиксы:
+  • Все тяжёлые операции на GPU (булевы коды, Jaccard, батч‑детектирование).
+  • Правильное согласование индексов прототипов и координат решётки через grid_idx:
+      – compute_E_norm() теперь переупорядочивает матрицу сходств S в порядок клеток решётки;
+      – activation_from_center() возвращает A в порядке решётки (по grid_idx);
+  • Матрица детектирования finalize_detection_matrix(): собирается ТОЛЬКО по валидным детекторам
+    (без пустых колонок), чтобы не было out‑of‑range индексов и ложного затирания;
+  • detect_batch_from_codes(): запись «только True» с OR‑семантикой (index_put_ + accumulate),
+    чтобы коллизии детекторов по bit_index не выключали ранее выставленные биты.
 
 Зависимости: torch, torchvision, numpy, tqdm
 """
@@ -48,18 +42,18 @@ NBITS = GRID * GRID * BITS_PER_CELL
 # DAMP раскладка прототипов
 DAMP_H = 32               # 32x32 = 1024 прототипов
 DAMP_W = 32
-LAM_FAR = 0.65  # §7.1.7: стартовый порог раскладки
-LAM_NEAR = 0.80  # §7.1.7: финальный порог раскладки
-ETA = 50.0  # ≈ жёсткая отсечка (η→∞), §7.1.7
-R_ENERGY = 6.0            # радиус для энергетики точки (осталось без изменения)            # радиус для энергетики точки
-PAIR_RADIUS = 16.0         # r≈d/2 для 32×32, §7.1.7         # локальный радиус для пары при шаге DAMP
+LAM_FAR = 0.65            # §7.1.7: стартовый порог раскладки
+LAM_NEAR = 0.80           # §7.1.7: финальный порог раскладки
+ETA = 50.0                # ≈ жёсткая отсечка (η→∞), §7.1.7
+R_ENERGY = 6.0            # радиус для энергетики точки
+PAIR_RADIUS = 16.0        # r≈d/2 для 32×32, §7.1.7
 
 # Детекторы
 DETECT_K = 512            # максимум детекторов (= длина выходного кода)
 MU_E_BUILD = 0.02         # порог по точкам при построении уровня
 MU_E_DETECT = 0.02        # порог по точкам при детектировании
 MU_D = 0.08               # порог уровня детектора (нормированная энергия)
-LAM_D = 0.70               # уровни детекторов в табл. 5: 0.5…0.85; по умолчанию берём среднее              # λ для τ в детектировании/построении
+LAM_D = 0.70              # λ в τ для A^λ; по умолчанию из диапазона табл. 5
 DBSCAN_EPS = 5.0
 DBSCAN_MIN_SAMPLES = 2
 DETECT_ATTEMPTS = 1024
@@ -95,15 +89,17 @@ LEVEL_CODE_BOOL = make_level_code_bool().to(DEVICE)
 
 # ===================== КОДИРОВАНИЕ (Torch) =====================
 
-def encode_batch_bool(imgs: torch.Tensor) -> torch.BoolTensor:
-    """imgs: [N,1,28,28] float in [0,1] → [N, NBITS] bool."""
-    x = F.avg_pool2d(imgs, kernel_size=4, stride=4)  # [N,1,7,7]
-    x = x.squeeze(1)                                  # [N,7,7]
+@torch.no_grad()
+def encode_batch_bool(imgs: torch.Tensor) -> torch.Tensor:
+    """imgs: [N,1,28,28] float in [0,1] → [N, NBITS] bool on the same device as LEVEL_CODE_BOOL."""
+    x = F.avg_pool2d(imgs, kernel_size=4, stride=4)   # [N,1,7,7]
+    x = x.squeeze(1)                                   # [N,7,7]
     q = torch.clamp(torch.floor(x * LEVELS), 0, LEVELS).to(torch.long)  # [N,7,7]
-    N = q.shape[0]
-    codes = LEVEL_CODE_BOOL[q.view(N, -1)]            # [N,49,128]
-    codes = codes.view(N, -1, BITS_PER_CELL)         # [N,49,128]
-    return codes.reshape(N, -1)                       # [N, NBITS]
+    N = q.size(0)
+    codes = LEVEL_CODE_BOOL[q.view(N, -1)]             # [N,49,128], dtype=bool
+    out = codes.reshape(N, -1).contiguous().to(torch.bool)  # [N, NBITS], ensure bool
+    assert out.dtype == torch.bool
+    return out                     # [N, NBITS]
 
 # ===================== Жаккар на GPU =====================
 
@@ -125,7 +121,7 @@ def jaccard_batch(P_codes: torch.BoolTensor, Q_codes: torch.BoolTensor) -> torch
     union = pop_q.unsqueeze(1) + pop_p.unsqueeze(0) - inter
     return inter / union.clamp_min(1e-6)
 
-# ===================== DAMP (хранит S на CPU, считает S на GPU) =====================
+# ===================== DAMP (S на CPU, вычисления на GPU) =====================
 
 @dataclass
 class DAMPLayoutTorch:
@@ -174,22 +170,21 @@ class DAMPLayoutTorch:
     def _sim_lambda(self, base: np.ndarray, lam: float) -> np.ndarray:
         return base * self._sigmoid(self.eta * (base - lam))
 
-    # ===== Векторизованная нормированная энергия точек (E_norm) =====
+    # ===== Правильная нормированная энергия точек (в координатах решётки) =====
     def compute_E_norm(self, lam: float) -> np.ndarray:
         self._ensure_sim()
-        N = self.N
-        ys, xs = np.divmod(np.arange(N, dtype=np.int32), self.W)
-        Y = ys[:, None]
-        X = xs[:, None]
-        Y2 = ys[None, :]
-        X2 = xs[None, :]
-        D = np.sqrt((Y - Y2) ** 2 + (X - X2) ** 2).astype(np.float32)  # [N,N]
+        N, H, W = self.N, self.H, self.W
+        grid_lin = self.grid_idx.reshape(-1)                      # позиция→индекс прототипа
+        S_l = self._sim_lambda(self._sim, lam)                    # [N,N] (индексы прототипов)
+        S_grid = S_l[grid_lin][:, grid_lin]                       # [N,N] (в порядке клеток решётки)
+        ys, xs = np.divmod(np.arange(N, dtype=np.int32), W)       # координаты клеток решётки
+        Y = ys[:, None].astype(np.float32)
+        X = xs[:, None].astype(np.float32)
+        D = np.sqrt((Y - Y.T)**2 + (X - X.T)**2)
         Wmask = (D <= self.r_energy) & (D > 0)
-        W = np.zeros_like(D, dtype=np.float32)
-        W[Wmask] = 1.0 / np.maximum(D[Wmask], 1e-6)
-        S_l = self._sim_lambda(self._sim, lam)
-        E = (W * S_l).sum(axis=1, dtype=np.float32)  # [N]
-        E = E.reshape(self.H, self.W)
+        Wgeo = np.zeros_like(D, dtype=np.float32)
+        Wgeo[Wmask] = 1.0 / np.maximum(D[Wmask], 1e-6)
+        E = (Wgeo * S_grid).sum(axis=1, dtype=np.float32).reshape(H, W)
         m = float(E.max()) if E.size else 1.0
         return (E / max(m, 1e-9)).astype(np.float32)
 
@@ -231,7 +226,7 @@ class DAMPLayoutTorch:
     def _random_pairs(self, p: int) -> List[Tuple[int, int]]:
         pairs: List[Tuple[int,int]] = []
         for _ in range(p):
-            a = np.random.randint(0, self.N)
+            a = np.random.randint(0, self.N);
             b = np.random.randint(0, self.N)
             while b == a:
                 b = np.random.randint(0, self.N)
@@ -314,13 +309,13 @@ class DetectorSpace:
     # Кэш для быстрых детектирований
     grid_order_t: torch.LongTensor | None = None      # [HW]
     E_norm_t: torch.Tensor | None = None              # [HW]
-    W_detect: torch.Tensor | None = None              # [HW, Kdet] веса Ê для детектирования
-    den_detect: torch.Tensor | None = None            # [Kdet] знаменатель e_d
-    det_bits: torch.LongTensor | None = None          # [Kdet] соответствие детектор→bit_index
+    W_detect: torch.Tensor | None = None              # [HW, Kvalid]
+    den_detect: torch.Tensor | None = None            # [Kvalid]
+    det_bits: torch.LongTensor | None = None          # [Kvalid]
 
     def __post_init__(self):
         if self.detectors is None: self.detectors = []
-        # Векторизованно считаем E_norm
+        # Правильная E_norm в координатах решётки
         self.E_norm = self.layout.compute_E_norm(lam=self.layout.lam_near)
         # Тензоры для GPU‑детектирования
         self.grid_order_t = torch.from_numpy(self.layout.grid_idx.reshape(-1)).to(DEVICE, dtype=torch.long)
@@ -334,8 +329,8 @@ class DetectorSpace:
     @torch.no_grad()
     def activation_batch_from_codes(self, Q_bool: torch.BoolTensor, lam_a: float = LAM_D, batch: int = BATCH_ENCODE) -> Iterable[torch.Tensor]:
         """Итератор по батчам A_flat: [nq, HW] (на DEVICE).
-           Считаем разом Жаккар Q против прототипов, применяем τ, затем переставляем
-           столбцы по grid_idx, чтобы получить A в порядке клетки решётки.
+           Считаем Жаккар Q против прототипов, применяем τ, затем переставляем
+           столбцы по grid_idx, чтобы получить A в порядке клеток решётки.
         """
         P = self.layout.codes_bool  # [Np, B]
         order = self.grid_order_t   # [HW]
@@ -347,24 +342,23 @@ class DetectorSpace:
             tau_perm = tau.index_select(dim=1, index=order)  # [nq, HW]
             yield tau_perm.to(torch.float32)
 
-    # ==== Подготовка матрицы детектирования (GPU) ====
+    # ==== Подготовка матрицы детектирования (GPU, только валидные детекторы) ====
     def finalize_detection_matrix(self, mu_e: float = MU_E_DETECT):
         if not self.detectors:
             self.W_detect = self.den_detect = self.det_bits = None
             return
         H, W = self.layout.H, self.layout.W
         HW = H * W
-        Kd = len(self.detectors)
-        Wmat = torch.zeros((HW, Kd), device=DEVICE, dtype=torch.float32)
-        den = torch.zeros((Kd,), device=DEVICE, dtype=torch.float32)
-        bits = torch.empty((Kd,), device=DEVICE, dtype=torch.long)
-
         E = self.E_norm.reshape(H, W)
-        for k, d in enumerate(self.detectors):
-            y0 = int(max(0, math.floor(d.c[0]-d.r)))
-            y1 = int(min(H, math.ceil(d.c[0]+d.r)+1))
-            x0 = int(max(0, math.floor(d.c[1]-d.r)))
-            x1 = int(min(W, math.ceil(d.c[1]+d.r)+1))
+
+        valid_lin: List[np.ndarray] = []
+        valid_w: List[np.ndarray] = []
+        valid_den: List[float] = []
+        valid_bits: List[int] = []
+
+        for d in self.detectors:
+            y0 = int(max(0, math.floor(d.c[0]-d.r))); y1 = int(min(H, math.ceil(d.c[0]+d.r)+1))
+            x0 = int(max(0, math.floor(d.c[1]-d.r))); x1 = int(min(W, math.ceil(d.c[1]+d.r)+1))
             YY, XX = np.meshgrid(np.arange(y0,y1), np.arange(x0,x1), indexing='ij')
             circle = ((YY - d.c[0])**2 + (XX - d.c[1])**2) <= (d.r*d.r)
             subE = E[y0:y1, x0:x1]
@@ -372,30 +366,50 @@ class DetectorSpace:
             if not np.any(mask):
                 continue
             lin = (YY * W + XX).reshape(-1)[mask.reshape(-1)]
-            lin_t = torch.from_numpy(lin.astype(np.int64)).to(DEVICE)
-            Wmat[lin_t, k] = torch.from_numpy(subE.reshape(-1)[mask.reshape(-1)].astype(np.float32)).to(DEVICE)
-            den[k] = max(float(d.energy), 1e-12)
-            bits[k] = int(d.bit_index)
+            wvals = subE.reshape(-1)[mask.reshape(-1)].astype(np.float32)
+            den = float(d.energy) if d.energy > 0.0 else float(wvals.sum())
+            if den <= 0.0:
+                continue
+            valid_lin.append(lin.astype(np.int64))
+            valid_w.append(wvals)
+            valid_den.append(den)
+            valid_bits.append(int(d.bit_index))
+
+        Kvalid = len(valid_lin)
+        if Kvalid == 0:
+            self.W_detect = torch.zeros((HW, 0), device=DEVICE, dtype=torch.float32)
+            self.den_detect = torch.zeros((0,), device=DEVICE, dtype=torch.float32)
+            self.det_bits = torch.zeros((0,), device=DEVICE, dtype=torch.long)
+            return
+
+        Wmat = torch.zeros((HW, Kvalid), device=DEVICE, dtype=torch.float32)
+        for j in range(Kvalid):
+            lin_t = torch.from_numpy(valid_lin[j]).to(DEVICE)
+            w_t   = torch.from_numpy(valid_w[j]).to(DEVICE)
+            Wmat[lin_t, j] = w_t
 
         self.W_detect = Wmat
-        self.den_detect = den
-        self.det_bits = bits
+        self.den_detect = torch.tensor(valid_den, device=DEVICE, dtype=torch.float32)
+        self.det_bits   = torch.tensor(valid_bits, device=DEVICE, dtype=torch.long)
 
-    # ==== Детектирование батчами (GPU) ====
+    # ==== Детектирование батчами (GPU) — OR‑семантика записи ====
     @torch.no_grad()
     def detect_batch_from_codes(self, Q_bool: torch.BoolTensor, lam_a: float = LAM_D, mu_d: float = MU_D) -> torch.BoolTensor:
         assert self.W_detect is not None and self.den_detect is not None and self.det_bits is not None, "Call finalize_detection_matrix() first"
-        out = torch.zeros((Q_bool.shape[0], self.out_bits), device=DEVICE, dtype=torch.bool)
+        nq = Q_bool.shape[0]
+        out = torch.zeros((nq, self.out_bits), device=DEVICE, dtype=torch.bool)
+        if self.W_detect.numel() == 0:
+            return out
         pos = 0
         for A_flat in self.activation_batch_from_codes(Q_bool, lam_a=lam_a, batch=BATCH_ENCODE):
-            nq = A_flat.shape[0]
-            S = (A_flat @ self.W_detect) / self.den_detect.clamp_min(1e-12)  # [nq,K]
+            bsz = A_flat.shape[0]
+            S = (A_flat @ self.W_detect) / self.den_detect.clamp_min(1e-12)  # [bsz, Kvalid]
             on = S >= mu_d
-            idx = self.det_bits.unsqueeze(0).expand_as(on)
-            out_part = torch.zeros((nq, self.out_bits), device=DEVICE, dtype=torch.bool)
-            out_part.scatter_(dim=1, index=idx, src=on)
-            out[pos:pos+nq] = out_part
-            pos += nq
+            if on.any():
+                rows, cols_valid = on.nonzero(as_tuple=True)
+                cols_bits = self.det_bits[cols_valid]
+                out[pos:pos+bsz].index_put_((rows, cols_bits), torch.tensor(True, device=DEVICE, dtype=torch.bool), accumulate=True)
+            pos += bsz
         return out
 
     # ==== Построение уровня детекторов (параллельные кандидаты + глобальное разрешение) ====
@@ -439,6 +453,7 @@ class DetectorSpace:
             d  = math.hypot(dy, dx)
             return (d <= r1) or (d <= r2)
 
+        # Выбор без перекрытия центров, по убыванию n_points/r
         candidates.sort(key=lambda d: (d.n_points / max(d.r, 1e-6)), reverse=True)
         kept: List[Detector] = []
         for d in candidates:
@@ -458,10 +473,11 @@ class DetectorSpace:
         self.detectors = kept
 
     def activation_from_center(self, proto_idx: int, lam_a: float = LAM_D) -> np.ndarray:
+        # Возвращаем A в порядке клеток решётки
         self.layout._ensure_sim()
-        sims = self.layout._sim[proto_idx].astype(np.float32)
+        sims = self.layout._sim[proto_idx].astype(np.float32)           # [N] индексы прототипов
         tau = sims * self._sigmoid_np(self.layout.eta * (sims - lam_a))
-        return tau.reshape(self.layout.H, self.layout.W)
+        return tau[self.layout.grid_idx]                                 # [H,W]
 
     def _cluster_points(self, A: np.ndarray, mu_e: float, eps: float, min_samples: int) -> List[np.ndarray]:
         mask = (self.E_norm >= mu_e) & (A > 0)
@@ -497,6 +513,7 @@ class DetectorSpace:
 
 # ===================== КЛАСС‑ПАМЯТЬ И ПРЕДСКАЗАНИЯ =====================
 
+@torch.no_grad()
 def build_class_memory(space: DetectorSpace, codes_bool: torch.BoolTensor, labels: np.ndarray,
                        lam_a: float, mu_e_detect: float, mu_d: float,
                        detect_k: int, target_density: float) -> np.ndarray:
@@ -504,13 +521,12 @@ def build_class_memory(space: DetectorSpace, codes_bool: torch.BoolTensor, label
     class_hv = np.zeros((10, detect_k), dtype=bool)
     counts = np.zeros((10, detect_k), dtype=np.int32)
 
-    with torch.no_grad():
-        for s in tqdm(range(0, codes_bool.shape[0], BATCH_ENCODE), desc="Class memory (batch)"):
-            e = min(s + BATCH_ENCODE, codes_bool.shape[0])
-            Q = codes_bool[s:e]
-            codes = space.detect_batch_from_codes(Q, lam_a=lam_a, mu_d=mu_d).detach().cpu().numpy()
-            for i in range(Q.shape[0]):
-                counts[int(labels[s+i])] += codes[i].astype(np.int32)
+    for s in tqdm(range(0, codes_bool.shape[0], BATCH_ENCODE), desc="Class memory (batch)"):
+        e = min(s + BATCH_ENCODE, codes_bool.shape[0])
+        Q = codes_bool[s:e]
+        codes = space.detect_batch_from_codes(Q, lam_a=lam_a, mu_d=mu_d).detach().cpu().numpy()
+        for i in range(Q.shape[0]):
+            counts[int(labels[s+i])] += codes[i].astype(np.int32)
 
     active_mask = counts.sum(axis=0) > 0
     active_idx = np.where(active_mask)[0]
@@ -546,7 +562,7 @@ def predict_batch(space: DetectorSpace, class_hv: np.ndarray, Q_bool: torch.Bool
         preds.append((arg, best, int(code.sum())))
     return np.array(preds, dtype=object)
 
-# ===================== MAIN =====================
+# ===================== MAIN (демо) =====================
 
 def main():
     print(f"[Info] Device: {DEVICE}")
@@ -559,19 +575,24 @@ def main():
     train_imgs = torch.stack([train_ds[i][0] for i in range(trn_limit)], dim=0).to(DEVICE)
     train_lbls = np.array([int(train_ds[i][1]) for i in range(trn_limit)], dtype=np.int16)
 
+    # Прототипы для DAMP
     P = DAMP_H * DAMP_W
     proto_idx = torch.randperm(trn_limit, generator=GEN)[:P]
     proto_codes = encode_batch_bool(train_imgs[proto_idx])
 
+    # DAMP
     damp = DAMPLayoutTorch(codes_bool=proto_codes, H=DAMP_H, W=DAMP_W,
                            lam_far=LAM_FAR, lam_near=LAM_NEAR, eta=ETA, r_energy=R_ENERGY, pair_radius=PAIR_RADIUS)
     damp.run(steps_far=8, steps_near=8, p_per_step=16384, min_near_steps=2)
 
+    # Детекторы
     space = DetectorSpace(layout=damp, out_bits=DETECT_K)
     space.build_level(lam_d=LAM_D, eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES,
                       mu_e=MU_E_BUILD, attempts=DETECT_ATTEMPTS, max_detectors=DETECT_K)
-    print("[Detectors] built:", len(space.detectors))
+    space.finalize_detection_matrix(mu_e=MU_E_DETECT)
+    print("[Detectors] built:", len(space.detectors), "| valid:", (space.W_detect.shape[1] if space.W_detect is not None else 0))
 
+    # Память классов
     train_codes_bool = encode_batch_bool(train_imgs)
     class_hv = build_class_memory(space,
                                   codes_bool=train_codes_bool,
@@ -579,6 +600,7 @@ def main():
                                   lam_a=LAM_D, mu_e_detect=MU_E_DETECT, mu_d=MU_D,
                                   detect_k=DETECT_K, target_density=TARGET_DENSITY)
 
+    # Оценка на всём тесте (демо)
     T = len(test_ds)
     test_imgs = torch.stack([test_ds[i][0] for i in range(T)], dim=0).to(DEVICE)
     test_codes_bool = encode_batch_bool(test_imgs)
@@ -589,6 +611,7 @@ def main():
     acc = ok / T
     print(f"[Eval] acc@{T}={acc:.3f} | bits_on min/med/max: {bits.min()} / {np.median(bits)} / {bits.max()}")
 
+    # Сохранение артефактов
     det_np = np.array([(d.c[0], d.c[1], d.r, d.lam, d.n_points, d.energy, d.bit_index) for d in space.detectors], dtype=np.float32)
     np.savez_compressed(
         OUT_NPZ,
@@ -621,7 +644,7 @@ def main():
             "pipeline": [
                 "28x28 -> 7x7 (avgpool + quantize)",
                 "population coding (49 x 128 const-weight) + concatenation (bool)",
-                "DAMP over P=H*W prototypes (Jaccard GPU, S on CPU)",
+                "DAMP over P=H*W prototypes (Jaccard GPU, S on CPU, grid_idx‑aware)",
                 "detector space (DBSCAN level, e_d on Ê>=μ_e, no center overlap, keep higher n/r, parallel candidates)",
                 "class-memory (top-k only active bits; batch detect via A@W)",
                 "inference by Jaccard to class vectors"
