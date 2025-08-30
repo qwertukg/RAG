@@ -413,7 +413,7 @@ class DetectorSpace:
             x0 = int(max(0, math.floor(c_d[1]-r_d))); x1 = int(min(W, math.ceil(c_d[1]+r_d)+1))
             YY, XX = np.meshgrid(np.arange(y0,y1), np.arange(x0,x1), indexing='ij')
             E = self.E_norm[y0:y1, x0:x1]
-            circle = ((YY - c_d[0])**2 + (XX - c_d[1])**2) <= (d.r*d.r)
+            circle = ((YY - c_d[0])**2 + (XX - c_d[1])**2) <= (r_d*r_d)
             mask = circle & (E >= mu_e)
             n_pts = int(mask.sum())
             if n_pts == 0:
