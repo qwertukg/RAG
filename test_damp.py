@@ -189,8 +189,12 @@ def main():
     # Прочее
     ap.add_argument("--seed", type=int, default=0,
                     help="ГПСЧ для воспроизводимости (выбор прототипов, порядок пар DAMP, сиды детекторов, битовые индексы и пр.).")
+    ap.add_argument("--r-energy", type=float, default=4.0,
+                    help="Радиус для энергетики точки при расчёте Ê (меньше = локальнее, острее).")
 
     args = ap.parse_args()
+
+    DML.R_ENERGY = args.r_energy
 
     rng = np.random.default_rng(args.seed)
     data_dir = getattr(DML, "DATA_DIR", "./data")
@@ -231,6 +235,14 @@ def main():
             rng=rng)
         print(f"[TRAIN] Detectors built: {len(space.detectors)}")
 
+        rs = [d.r for d in space.detectors]
+        print("r min/med/max:", (min(rs) if rs else None), (np.median(rs) if rs else None), (max(rs) if rs else None))
+
+        # оценим долю клеток с Ê≥μ_e на этапе ПОСТРОЕНИЯ (если она велика — кластеры будут пухлыми)
+        mu_e_b = args.mu_e_build
+        E = space.E_norm  # [H,W]
+        print("frac(E>=mu_e_build):", float((E >= mu_e_b).mean()))
+
         train_codes = DML.encode_batch_bool(train_imgs_t)
         class_hv = DML.build_class_memory(space, codes_bool=train_codes, labels=train_lbls,
                                           lam_a=args.lam_d, mu_e_detect=args.mu_e_detect, mu_d=args.mu_d,
@@ -264,6 +276,8 @@ def main():
     te_imgs_t = torch.stack([te[i][0] for i in range(sample_n)], dim=0).to(DML.DEVICE)
     te_codes = DML.encode_batch_bool(te_imgs_t)
     space.finalize_detection_matrix(mu_e=args.mu_e_detect)
+    print("[Detectors] built:", len(space.detectors), "| valid:", space.W_detect.shape[1])
+
     with torch.no_grad():
         codes = space.detect_batch_from_codes(te_codes, lam_a=args.lam_d, mu_d=args.mu_d).cpu().numpy()
     bits_on_arr = codes.sum(axis=1).astype(int)

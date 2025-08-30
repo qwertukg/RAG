@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MNIST → DAMP (§5) → Детекторы (§6) — реализация на PyTorch/CUDA (исправленная «фундаменталка»).
-
-Ключевые моменты и фиксы:
-  • Все тяжёлые операции на GPU (булевы коды, Jaccard, батч‑детектирование).
-  • Правильное согласование индексов прототипов и координат решётки через grid_idx:
-      – compute_E_norm() теперь переупорядочивает матрицу сходств S в порядок клеток решётки;
-      – activation_from_center() возвращает A в порядке решётки (по grid_idx);
-  • Матрица детектирования finalize_detection_matrix(): собирается ТОЛЬКО по валидным детекторам
-    (без пустых колонок), чтобы не было out‑of‑range индексов и ложного затирания;
-  • detect_batch_from_codes(): запись «только True» с OR‑семантикой (index_put_ + accumulate),
-    чтобы коллизии детекторов по bit_index не выключали ранее выставленные биты.
+MNIST → DAMP (§5) → Детекторы (§6) — реализация на PyTorch/CUDA
+(исправленная «фундаменталка» + 2 дополнения по статье):
+  1) Агрегация по нескольким стимулам: a_{ji} = max_{s∈S} sim_λ(s, v_{ji})
+     Поддерживается форма входа [N,B] (как раньше) ИЛИ [N,M,B] (M стимулов на объект).
+  2) Цветовое объединение с насыщением σ: после подсчёта E(d,A) и порога μ_d
+     оставляем на объект не более σ детекторов с максимумом энергии.
 
 Зависимости: torch, torchvision, numpy, tqdm
 """
@@ -21,7 +16,7 @@ import os
 import math
 import json
 from dataclasses import dataclass
-from typing import Tuple, List, Iterable
+from typing import Tuple, List, Iterable, Optional
 
 import numpy as np
 import torch
@@ -58,7 +53,10 @@ DBSCAN_EPS = 5.0
 DBSCAN_MIN_SAMPLES = 2
 DETECT_ATTEMPTS = 1024
 
-# Класс‑память
+# Цветовое объединение: насыщение σ (None = без ограничения)
+SIGMA: Optional[int] = 64  # напр. 64 или 128, чтобы жёстко ограничить число выставленных бит
+
+# Класс-память
 TARGET_DENSITY = 0.35
 
 # Батчи / загрузка
@@ -74,6 +72,7 @@ OUT_NPZ = "mnist_damp_detectors_torch.npz"
 OUT_META = "mnist_damp_detectors_torch.meta.json"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 GEN = torch.Generator(device="cpu").manual_seed(SEED)
+_TRUE = torch.tensor(True, device=DEVICE, dtype=torch.bool)
 
 # ===================== КОДБУК УРОВНЕЙ (Torch) =====================
 # level_code_bool: [LEVELS+1, BITS_PER_CELL] (level 0 — все нули)
@@ -90,16 +89,14 @@ LEVEL_CODE_BOOL = make_level_code_bool().to(DEVICE)
 # ===================== КОДИРОВАНИЕ (Torch) =====================
 
 @torch.no_grad()
-def encode_batch_bool(imgs: torch.Tensor) -> torch.Tensor:
-    """imgs: [N,1,28,28] float in [0,1] → [N, NBITS] bool on the same device as LEVEL_CODE_BOOL."""
-    x = F.avg_pool2d(imgs, kernel_size=4, stride=4)   # [N,1,7,7]
-    x = x.squeeze(1)                                   # [N,7,7]
+def encode_batch_bool(imgs: torch.Tensor) -> torch.BoolTensor:
+    """imgs: [N,1,28,28] float in [0,1] → [N, NBITS] bool."""
+    x = F.avg_pool2d(imgs, kernel_size=4, stride=4)  # [N,1,7,7]
+    x = x.squeeze(1)                                  # [N,7,7]
     q = torch.clamp(torch.floor(x * LEVELS), 0, LEVELS).to(torch.long)  # [N,7,7]
-    N = q.size(0)
-    codes = LEVEL_CODE_BOOL[q.view(N, -1)]             # [N,49,128], dtype=bool
-    out = codes.reshape(N, -1).contiguous().to(torch.bool)  # [N, NBITS], ensure bool
-    assert out.dtype == torch.bool
-    return out                     # [N, NBITS]
+    N = q.shape[0]
+    codes = LEVEL_CODE_BOOL[q.view(N, -1)]            # [N,49,128]
+    return codes.reshape(N, -1)                       # [N, NBITS]
 
 # ===================== Жаккар на GPU =====================
 
@@ -226,7 +223,7 @@ class DAMPLayoutTorch:
     def _random_pairs(self, p: int) -> List[Tuple[int, int]]:
         pairs: List[Tuple[int,int]] = []
         for _ in range(p):
-            a = np.random.randint(0, self.N);
+            a = np.random.randint(0, self.N)
             b = np.random.randint(0, self.N)
             while b == a:
                 b = np.random.randint(0, self.N)
@@ -317,7 +314,7 @@ class DetectorSpace:
         if self.detectors is None: self.detectors = []
         # Правильная E_norm в координатах решётки
         self.E_norm = self.layout.compute_E_norm(lam=self.layout.lam_near)
-        # Тензоры для GPU‑детектирования
+        # Тензоры для GPU-детектирования
         self.grid_order_t = torch.from_numpy(self.layout.grid_idx.reshape(-1)).to(DEVICE, dtype=torch.long)
         self.E_norm_t = torch.from_numpy(self.E_norm.reshape(-1)).to(DEVICE, dtype=torch.float32)
 
@@ -325,22 +322,46 @@ class DetectorSpace:
     def _sigmoid_np(x: np.ndarray) -> np.ndarray:
         return 1.0 / (1.0 + np.exp(-x))
 
-    # ==== Батч‑активации на GPU ====
+    # ==== Батч-активации на GPU ==== (поддержка нескольких стимулов)
     @torch.no_grad()
-    def activation_batch_from_codes(self, Q_bool: torch.BoolTensor, lam_a: float = LAM_D, batch: int = BATCH_ENCODE) -> Iterable[torch.Tensor]:
-        """Итератор по батчам A_flat: [nq, HW] (на DEVICE).
-           Считаем Жаккар Q против прототипов, применяем τ, затем переставляем
-           столбцы по grid_idx, чтобы получить A в порядке клеток решётки.
+    def activation_batch_from_codes(
+        self,
+        Q_bool: torch.BoolTensor,                # [nq,B] ИЛИ [nq,M,B]
+        lam_a: float = LAM_D,
+        batch: int = BATCH_ENCODE
+    ) -> Iterable[torch.Tensor]:
+        """Итератор по батчам агрегированных A_flat: [bsz, HW] (на DEVICE).
+           Считаем Жаккар(ы) Q против прототипов, применяем τ, переставляем
+           столбцы по grid_idx, и если M>1 — делаем max по оси стимулов.
         """
         P = self.layout.codes_bool  # [Np, B]
         order = self.grid_order_t   # [HW]
-        for s in range(0, Q_bool.shape[0], batch):
-            e = min(s + batch, Q_bool.shape[0])
-            Q = Q_bool[s:e]
-            S = jaccard_batch(P, Q)               # [nq,Np]
-            tau = S * torch.sigmoid(self.layout.eta * (S - lam_a))
-            tau_perm = tau.index_select(dim=1, index=order)  # [nq, HW]
-            yield tau_perm.to(torch.float32)
+
+        if Q_bool.dim() == 2:
+            # Обычный случай: [nq,B]
+            Nq = Q_bool.shape[0]
+            for s in range(0, Nq, batch):
+                e = min(s + batch, Nq)
+                Q = Q_bool[s:e]                       # [bsz,B]
+                S = jaccard_batch(P, Q)               # [bsz,Np]
+                tau = S * torch.sigmoid(self.layout.eta * (S - lam_a))
+                tau_perm = tau.index_select(dim=1, index=order)  # [bsz, HW]
+                yield tau_perm.to(torch.float32)
+        elif Q_bool.dim() == 3:
+            # Несколько стимулов: [nq, M, B]
+            Nq, M, B = Q_bool.shape
+            for s in range(0, Nq, batch):
+                e = min(s + batch, Nq)
+                Q = Q_bool[s:e]                       # [bsz,M,B]
+                Qf = Q.reshape(-1, B)                 # [bsz*M,B]
+                S = jaccard_batch(P, Qf)              # [bsz*M,Np]
+                tau = S * torch.sigmoid(self.layout.eta * (S - lam_a))
+                tau_perm = tau.index_select(dim=1, index=order)  # [bsz*M, HW]
+                tau_perm = tau_perm.reshape(-1, M, order.numel())  # [bsz,M,HW]
+                A_max = tau_perm.max(dim=1).values    # [bsz,HW]  ← max по стимулам
+                yield A_max.to(torch.float32)
+        else:
+            raise ValueError("Q_bool must have shape [nq,B] or [nq,M,B]")
 
     # ==== Подготовка матрицы детектирования (GPU, только валидные детекторы) ====
     def finalize_detection_matrix(self, mu_e: float = MU_E_DETECT):
@@ -377,9 +398,9 @@ class DetectorSpace:
 
         Kvalid = len(valid_lin)
         if Kvalid == 0:
-            self.W_detect = torch.zeros((HW, 0), device=DEVICE, dtype=torch.float32)
+            self.W_detect  = torch.zeros((HW, 0), device=DEVICE, dtype=torch.float32)
             self.den_detect = torch.zeros((0,), device=DEVICE, dtype=torch.float32)
-            self.det_bits = torch.zeros((0,), device=DEVICE, dtype=torch.long)
+            self.det_bits   = torch.zeros((0,), device=DEVICE, dtype=torch.long)
             return
 
         Wmat = torch.zeros((HW, Kvalid), device=DEVICE, dtype=torch.float32)
@@ -388,27 +409,59 @@ class DetectorSpace:
             w_t   = torch.from_numpy(valid_w[j]).to(DEVICE)
             Wmat[lin_t, j] = w_t
 
-        self.W_detect = Wmat
+        self.W_detect  = Wmat
         self.den_detect = torch.tensor(valid_den, device=DEVICE, dtype=torch.float32)
         self.det_bits   = torch.tensor(valid_bits, device=DEVICE, dtype=torch.long)
 
-    # ==== Детектирование батчами (GPU) — OR‑семантика записи ====
+    # ==== Детектирование батчами (GPU) — OR-семантика + насыщение σ ====
     @torch.no_grad()
-    def detect_batch_from_codes(self, Q_bool: torch.BoolTensor, lam_a: float = LAM_D, mu_d: float = MU_D) -> torch.BoolTensor:
+    def detect_batch_from_codes(
+        self,
+        Q_bool: torch.BoolTensor,                    # [nq,B] ИЛИ [nq,M,B]
+        lam_a: float = LAM_D,
+        mu_d: float = MU_D,
+        sigma: Optional[int] = SIGMA                 # максимум активных битов; None = без ограничения
+    ) -> torch.BoolTensor:
         assert self.W_detect is not None and self.den_detect is not None and self.det_bits is not None, "Call finalize_detection_matrix() first"
-        nq = Q_bool.shape[0]
+        # Определим количество объектов nq
+        if Q_bool.dim() == 2:
+            nq = Q_bool.shape[0]
+        elif Q_bool.dim() == 3:
+            nq = Q_bool.shape[0]
+        else:
+            raise ValueError("Q_bool must have shape [nq,B] or [nq,M,B]")
+
         out = torch.zeros((nq, self.out_bits), device=DEVICE, dtype=torch.bool)
         if self.W_detect.numel() == 0:
             return out
+
         pos = 0
+        HW, Kvalid = self.W_detect.shape
         for A_flat in self.activation_batch_from_codes(Q_bool, lam_a=lam_a, batch=BATCH_ENCODE):
-            bsz = A_flat.shape[0]
+            bsz = A_flat.shape[0]                          # [bsz,HW]
             S = (A_flat @ self.W_detect) / self.den_detect.clamp_min(1e-12)  # [bsz, Kvalid]
-            on = S >= mu_d
-            if on.any():
-                rows, cols_valid = on.nonzero(as_tuple=True)
-                cols_bits = self.det_bits[cols_valid]
-                out[pos:pos+bsz].index_put_((rows, cols_bits), torch.tensor(True, device=DEVICE, dtype=torch.bool), accumulate=True)
+
+            if sigma is None:
+                # Порог + простая дизъюнкция
+                on = S >= mu_d
+                if on.any():
+                    rows, cols_valid = on.nonzero(as_tuple=True)
+                    cols_bits = self.det_bits[cols_valid]
+                    out[pos:pos+bsz].index_put_((rows, cols_bits), _TRUE, accumulate=True)
+            else:
+                # Насыщение σ: на объект максимум σ самых «сильных» детекторов (с учётом порога μ_d)
+                k = min(int(sigma), Kvalid)
+                if k <= 0:
+                    pos += bsz
+                    continue
+                Sm = S.masked_fill(S < mu_d, float('-inf'))   # отбросить слабые
+                topv, topi = torch.topk(Sm, k=k, dim=1)       # [bsz,k]
+                keep = topv > float('-inf')                   # те, что прошли порог
+                if keep.any():
+                    r, c = keep.nonzero(as_tuple=True)        # индексы внутри окна [0..bsz), [0..k)
+                    cols_valid = topi[r, c]                   # позиции в Kvalid
+                    cols_bits  = self.det_bits[cols_valid]    # соответствующие выходные биты
+                    out[pos:pos+bsz].index_put_((r, cols_bits), _TRUE, accumulate=True)
             pos += bsz
         return out
 
@@ -511,23 +564,27 @@ class DetectorSpace:
             if val > best_val: best_val, best_r = val, r
         return float(best_r)
 
-# ===================== КЛАСС‑ПАМЯТЬ И ПРЕДСКАЗАНИЯ =====================
+# ===================== КЛАСС-ПАМЯТЬ И ПРЕДСКАЗАНИЯ =====================
 
 @torch.no_grad()
 def build_class_memory(space: DetectorSpace, codes_bool: torch.BoolTensor, labels: np.ndarray,
                        lam_a: float, mu_e_detect: float, mu_d: float,
-                       detect_k: int, target_density: float) -> np.ndarray:
+                       detect_k: int, target_density: float,
+                       sigma: Optional[int] = SIGMA) -> np.ndarray:
+    """codes_bool: [N,B] ИЛИ [N,M,B] — если M>1, активации агрегируются max по M."""
     space.finalize_detection_matrix(mu_e=mu_e_detect)
     class_hv = np.zeros((10, detect_k), dtype=bool)
     counts = np.zeros((10, detect_k), dtype=np.int32)
 
+    # Пакетное детектирование с поддержкой σ
     for s in tqdm(range(0, codes_bool.shape[0], BATCH_ENCODE), desc="Class memory (batch)"):
         e = min(s + BATCH_ENCODE, codes_bool.shape[0])
         Q = codes_bool[s:e]
-        codes = space.detect_batch_from_codes(Q, lam_a=lam_a, mu_d=mu_d).detach().cpu().numpy()
+        codes = space.detect_batch_from_codes(Q, lam_a=lam_a, mu_d=mu_d, sigma=sigma).detach().cpu().numpy()
         for i in range(Q.shape[0]):
             counts[int(labels[s+i])] += codes[i].astype(np.int32)
 
+    # Топ-k по активным битам (только среди реально активных хотя бы в одном классе)
     active_mask = counts.sum(axis=0) > 0
     active_idx = np.where(active_mask)[0]
     num_active = int(active_idx.size)
@@ -546,9 +603,11 @@ def build_class_memory(space: DetectorSpace, codes_bool: torch.BoolTensor, label
 
 @torch.no_grad()
 def predict_batch(space: DetectorSpace, class_hv: np.ndarray, Q_bool: torch.BoolTensor,
-                  lam_a: float, mu_e_detect: float, mu_d: float) -> np.ndarray:
+                  lam_a: float, mu_e_detect: float, mu_d: float,
+                  sigma: Optional[int] = SIGMA) -> np.ndarray:
+    """Q_bool: [N,B] ИЛИ [N,M,B] — если M>1, активации агрегируются max по M."""
     space.finalize_detection_matrix(mu_e=mu_e_detect)
-    codes = space.detect_batch_from_codes(Q_bool, lam_a=lam_a, mu_d=mu_d).detach().cpu().numpy()
+    codes = space.detect_batch_from_codes(Q_bool, lam_a=lam_a, mu_d=mu_d, sigma=sigma).detach().cpu().numpy()
     preds = []
     for i in range(codes.shape[0]):
         code = codes[i]
@@ -592,20 +651,22 @@ def main():
     space.finalize_detection_matrix(mu_e=MU_E_DETECT)
     print("[Detectors] built:", len(space.detectors), "| valid:", (space.W_detect.shape[1] if space.W_detect is not None else 0))
 
-    # Память классов
-    train_codes_bool = encode_batch_bool(train_imgs)
+    # Память классов (один стимул на объект; для нескольких: соберите [N,M,B] и передайте сюда)
+    train_codes_bool = encode_batch_bool(train_imgs)  # [N,B]
     class_hv = build_class_memory(space,
                                   codes_bool=train_codes_bool,
                                   labels=train_lbls,
                                   lam_a=LAM_D, mu_e_detect=MU_E_DETECT, mu_d=MU_D,
-                                  detect_k=DETECT_K, target_density=TARGET_DENSITY)
+                                  detect_k=DETECT_K, target_density=TARGET_DENSITY,
+                                  sigma=SIGMA)
 
     # Оценка на всём тесте (демо)
     T = len(test_ds)
     test_imgs = torch.stack([test_ds[i][0] for i in range(T)], dim=0).to(DEVICE)
-    test_codes_bool = encode_batch_bool(test_imgs)
+    test_codes_bool = encode_batch_bool(test_imgs)  # [T,B]
     preds = predict_batch(space, class_hv, test_codes_bool,
-                          lam_a=LAM_D, mu_e_detect=MU_E_DETECT, mu_d=MU_D)
+                          lam_a=LAM_D, mu_e_detect=MU_E_DETECT, mu_d=MU_D,
+                          sigma=SIGMA)
     ok = sum(int(p[0] == int(test_ds[i][1])) for i, p in enumerate(preds))
     bits = np.array([p[2] for p in preds[:min(256, len(preds))]])
     acc = ok / T
@@ -636,7 +697,10 @@ def main():
                 "MU_E_BUILD": MU_E_BUILD, "MU_E_DETECT": MU_E_DETECT, "MU_D": MU_D,
                 "DBSCAN_EPS": DBSCAN_EPS, "DBSCAN_MIN_SAMPLES": DBSCAN_MIN_SAMPLES,
                 "ATTEMPTS": DETECT_ATTEMPTS,
-                "strict_build": True, "nms_rule": "no-center-overlap, keep higher n/r, parallel candidates"
+                "SIGMA": SIGMA,
+                "strict_build": True,
+                "nms_rule": "no-center-overlap, keep higher n/r, parallel candidates",
+                "multi_stimuli_aggregation": "A = max_s τ(sim(s,·))"
             },
             "TARGET_DENSITY": TARGET_DENSITY,
             "SEED": SEED,
@@ -644,9 +708,9 @@ def main():
             "pipeline": [
                 "28x28 -> 7x7 (avgpool + quantize)",
                 "population coding (49 x 128 const-weight) + concatenation (bool)",
-                "DAMP over P=H*W prototypes (Jaccard GPU, S on CPU, grid_idx‑aware)",
+                "DAMP over P=H*W prototypes (Jaccard GPU, S on CPU, grid_idx-aware)",
                 "detector space (DBSCAN level, e_d on Ê>=μ_e, no center overlap, keep higher n/r, parallel candidates)",
-                "class-memory (top-k only active bits; batch detect via A@W)",
+                "class-memory (top-k only active bits; batch detect via A@W; optional σ saturation; multi-stimuli max)",
                 "inference by Jaccard to class vectors"
             ]
         }, f, ensure_ascii=False, indent=2)
