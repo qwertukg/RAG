@@ -470,8 +470,8 @@ def main():
         rec = {
             "idx": int(ix),
             "prediction": int(pred),
-            "confidence": float(conf),
             "truth": truth,
+            "confidence": float(conf),
             "bits_on": int(bits_on),
         }
         results.append(rec)
