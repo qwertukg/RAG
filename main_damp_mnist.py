@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MNIST-пайплайн с заменой простого hash-grid на DAMP (§5) и детекторами «по науке» (§6).
+Полный пайплайн MNIST с DAMP (§5) и детекторами «по документу» (§6),
+включая:
+  • кодирование 28×28 → 7×7 → популяционные коды 49×128 (const-weight) → конкатенация;
+  • упакованные битсеты (6272 бита → 98×uint64) и Жаккар над ними;
+  • DAMP-раскладку прототипов (pairwise Jaccard, far/near, гарантируем min шагов near);
+  • построение пространства детекторов: A^{λ}(S) от top-K прототипов, DBSCAN, центр/радиус,
+    энергия детектора e_d = Σ A·Ê внутри круга, NMS по IoU кругов с критерием «плотности энергии»;
+  • детектирование: E(d,A) = (Σ_{Ê≥μ_e, внутри круга} A·Ê) / e_d ≥ μ_d;
+  • класс‑память: счётчики → top‑k только среди реально встречавшихся битов, Жаккар к класс‑векторам.
 
-Зависимости: numpy, tqdm, torchvision
-
-Идея:
-  1) Базовое кодирование изображений как в вашем main_da.py: 28x28 -> 7x7 avgpool -> уровни ->
-     популяционные коды (49×128) -> конкатенация => бит-вектор длины 6272.
-  2) Формируем набор из P прототипов (V) — подмножество обучающих кодов. Строим DAMP-раскладку
-     этих прототипов на решётке H×W (N=H*W≈P). Сходство — Жаккар над упакованными битсетами.
-  3) По раскладке строим пространство детекторов (§6.3–6.5). Детектор активен по нормированному
-     отклику E(d, A) ≥ μ_d, где A — объединённая активация от кода запроса.
-  4) Для каждого изображения получаем бинарный «детекторный» код; по нему строим класс‑память
-     (top‑k до TARGET_DENSITY). Инференс — Жаккар к класс‑векторам.
-
-Примечание: DAMP тут строится над прототипами (P≈H·W≈1024 по умолчанию),
-что делает O(P^2) попарных сходств выполнимыми.
+Зависимости: numpy, tqdm, torchvision, torch
 """
 
+from __future__ import annotations
 import os, json, math
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,11 +26,11 @@ from torchvision import datasets
 from torchvision.transforms import ToTensor
 
 # ===================== ПАРАМЕТРЫ =====================
-# Сенсорный фронт и коды (как в вашем main_da.py)
+# Сенсорный фронт и коды (как в main_da.py)
 GRID = 7                   # 28x28 -> 7x7 (avgpool 4x4)
-LEVELS = 4                 # 0..LEVELS
+LEVELS = 4                 # уровни квантизации 0..LEVELS
 BITS_PER_CELL = 128
-K_BITS_PER_LEVEL = 16
+K_BITS_PER_LEVEL = 16      # вес кода уровня (const-weight)
 
 # k-NN (базовый путь для сравнения)
 KNN_K = 7
@@ -42,27 +38,29 @@ KNN_K = 7
 # DAMP раскладка прототипов
 DAMP_H = 32               # 32x32 = 1024 прототипов
 DAMP_W = 32
-LAM_FAR = 0.05            # мягкие пороги — Жаккар на разрежённых кодах мал
-LAM_NEAR = 0.05
+LAM_FAR = 0.03
+LAM_NEAR = 0.03
 ETA = 12.0
-R_ENERGY = 6.0            # радиус для энергии точки
-PAIR_RADIUS = 8.0         # локальный радиус для пары
+R_ENERGY = 6.0            # радиус для энергетики точки
+PAIR_RADIUS = 8.0         # локальный радиус для пары при шаге DAMP
 
 # Детекторы
-DETECT_K = 512            # max число детекторов (и длина выходного кода)
-MU_E_BUILD = 0.08         # порог по точкам при построении уровня
-MU_E_DETECT = 0.06        # порог по точкам при детектировании
-MU_D = 0.14               # порог уровня детектора (нормированная энергия)
-LAM_D = 0.05              # порог λ на уровне детектора
-DBSCAN_EPS = 2.0          # плотностная кластеризация
-DBSCAN_MIN_SAMPLES = 3
-DETECT_ATTEMPTS = 120     # попытки «посева» детекторов
+DETECT_K = 512            # максимум детекторов (= длина выходного кода)
+MU_E_BUILD = 0.02         # порог по точкам при построении уровня
+MU_E_DETECT = 0.02        # порог по точкам при детектировании
+MU_D = 0.08               # порог уровня детектора (нормированная энергия)
+LAM_D = 0.03              # λ для τ в детектировании/построении
+DBSCAN_EPS = 5.0
+DBSCAN_MIN_SAMPLES = 2
+DETECT_ATTEMPTS = 1024
+SEEDS_TOPK = 16           # сколько прототипов объединять в A^{λ}(S)
+IOU_THR = 0.6             # допуск перекрытия детекторов
 
 # Класс‑память
-TARGET_DENSITY = 0.20     # конечная плотность бита в классовом коде
+TARGET_DENSITY = 0.35
 
 # Прочее
-TRAIN_LIMIT = None        # ограничение train для отладки
+TRAIN_LIMIT = None        # можно ограничить train для отладки
 SEED = 42
 DATA_DIR = "./data"
 OUT_NPZ = "mnist_damp_detectors.npz"
@@ -125,7 +123,6 @@ NBLK64 = (NBITS + 63)//64                  # 98
 
 def blocks_to_u64bits(code_blocks: np.ndarray) -> np.ndarray:
     # code_blocks: (49, 2) uint64 — 128 бит на блок
-    # распакуем в bool (49,128), затем в плоский bool (6272), затем упакуем в 98×uint64
     bits = np.unpackbits(code_blocks.view(np.uint8), axis=-1)
     bits = bits.reshape(code_blocks.shape[0], -1).reshape(-1).astype(np.uint8)  # (6272,)
     pad = (NBLK64*64 - NBITS)
@@ -140,19 +137,17 @@ def blocks_to_u64bits(code_blocks: np.ndarray) -> np.ndarray:
 # ---- Жаккар для упакованных битсетов ----
 
 def popcount_u64_vec(arr_u64: np.ndarray) -> np.ndarray:
-    # суммируем LUT по байтам
     v = arr_u64.view(np.uint8)
     return LUT8[v].sum(axis=-1, dtype=np.int32)
 
 def jaccard_u64(a: np.ndarray, b: np.ndarray, pc_a: int | None = None, pc_b: np.ndarray | None = None) -> np.ndarray:
-    # a: (NBLK64,), b: (M, NBLK64) -> sim (M,)
     inter = popcount_u64_vec(np.bitwise_and(b, a))
     if pc_a is None: pc_a = int(popcount_u64_vec(a).sum())
     if pc_b is None: pc_b = popcount_u64_vec(b)
     uni = np.maximum(pc_a + pc_b - inter, 1)
     return inter / uni
 
-# ===================== DAMP для упакованных кодов =====================
+# ===================== DAMP =====================
 
 @dataclass
 class DAMPLayoutPacked:
@@ -171,7 +166,7 @@ class DAMPLayoutPacked:
         self.N = self.codes64.shape[0]
         assert self.H * self.W == self.N
         self.grid_idx = self.rng.permutation(self.N).reshape(self.H, self.W)
-        self._sim = None  # будет [N,N] float32
+        self._sim: np.ndarray | None = None  # [N,N] float32
 
     def _ensure_sim(self):
         if self._sim is not None:
@@ -182,7 +177,7 @@ class DAMPLayoutPacked:
             a = self.codes64[i]
             sim = jaccard_u64(a, self.codes64, pc_a=int(self.pops[i]), pc_b=self.pops)
             self._sim[i] = sim.astype(np.float32)
-        # симметрия уже есть, но можно усреднить
+        # симметризуем
         self._sim = np.maximum(self._sim, self._sim.T)
 
     def coords_of(self, idx: int) -> Tuple[int, int]:
@@ -251,7 +246,7 @@ class DAMPLayoutPacked:
             pairs.append((int(a), int(b)))
         return pairs
 
-    def step(self, p: int = 2048, mode: str = "far") -> int:
+    def step(self, p: int = 4096, mode: str = "far") -> int:
         swapped = 0
         for (i1, i2) in self._random_pairs(p):
             phi_c, phi_s = self._pair_energy(i1, i2, mode=mode)
@@ -263,18 +258,23 @@ class DAMPLayoutPacked:
                 swapped += 1
         return swapped
 
-    def run(self, steps_far: int = 4, steps_near: int = 4, p_per_step: int = 4096) -> None:
+    def run(self, steps_far: int = 4, steps_near: int = 4, p_per_step: int = 4096, min_near_steps: int = 2) -> None:
         for _ in tqdm(range(steps_far), desc="DAMP far"):
-            if self.step(p=p_per_step, mode="far") == 0: break
-        for _ in tqdm(range(steps_near), desc="DAMP near"):
-            if self.step(p=p_per_step, mode="near") == 0: break
+            if self.step(p=p_per_step, mode="far") == 0:
+                break
+        for i in tqdm(range(steps_near), desc="DAMP near"):
+            swaps = self.step(p=p_per_step, mode="near")
+            if (i + 1) < min_near_steps:
+                continue
+            if swaps == 0:
+                break
 
     # Вектор сходств «запрос против всех прототипов»
     def sim_to_all(self, q64: np.ndarray) -> np.ndarray:
         pc_q = int(popcount_u64_vec(q64).sum())
         return jaccard_u64(q64, self.codes64, pc_a=pc_q, pc_b=self.pops)
 
-# ===================== ДЕТЕКТОРЫ (адаптация под packed+DAMP) =====================
+# ===================== ДЕТЕКТОРЫ =====================
 
 @dataclass
 class Detector:
@@ -341,6 +341,16 @@ class DetectorSpace:
         tau = base * (1.0 / (1.0 + np.exp(-self.layout.eta * (base - lam_a))))
         return tau.reshape(self.layout.H, self.layout.W)
 
+    def activation_from_indices(self, proto_indices: np.ndarray, lam_a: float = LAM_D) -> np.ndarray:
+        """Объединённая активация A^{λ}(S) по множеству прототипов S (максимум по τ)."""
+        self.layout._ensure_sim()
+        sims = self.layout._sim[proto_indices]  # shape: [K, N]
+        if sims.ndim == 1:
+            sims = sims[None, :]
+        tau = sims * (1.0 / (1.0 + np.exp(-self.layout.eta * (sims - lam_a))))
+        A = tau.max(axis=0).reshape(self.layout.H, self.layout.W)
+        return A
+
     def _cluster_points(self, A: np.ndarray, mu_e: float, eps: float, min_samples: int) -> List[np.ndarray]:
         mask = (self.E_norm >= mu_e) & (A > 0)
         Ys, Xs = np.where(mask)
@@ -373,49 +383,71 @@ class DetectorSpace:
             if val > best_val: best_val, best_r = val, r
         return float(best_r)
 
-    def _can_insert(self, c: Tuple[float,float], r: float, lam: float, n_fill: float) -> Tuple[bool, List[int]]:
-        to_remove: List[int] = []
-        for i, d in enumerate(self.detectors):
-            if abs(d.lam - lam) > 1e-9: continue
-            dist = math.hypot(d.c[0]-c[0], d.c[1]-c[1])
-            if dist <= r or dist <= d.r:
-                if n_fill > (d.n_points / max(d.r, 1e-6)): to_remove.append(i)
-                else: return (False, [])
-        return (True, to_remove)
+    @staticmethod
+    def _circle_iou(c1, r1, c2, r2) -> float:
+        dy = c1[0]-c2[0]; dx = c1[1]-c2[1]
+        d  = math.hypot(dy, dx)
+        if d >= r1 + r2: return 0.0
+        if d <= abs(r1 - r2):
+            inter = math.pi * min(r1, r2)**2
+        else:
+            a1 = math.acos(max(-1.0, min(1.0, (d*d + r1*r1 - r2*r2) / (2*d*r1))))
+            a2 = math.acos(max(-1.0, min(1.0, (d*d + r2*r2 - r1*r1) / (2*d*r2))))
+            inter = r1*r1*a1 + r2*r2*a2 - 0.5*math.sqrt(max(0.0, (-d+r1+r2)*(d+r1-r2)*(d-r1+r2)*(d+r1+r2)))
+        union = math.pi*(r1*r1 + r2*r2) - inter
+        return 0.0 if union <= 0 else inter/union
+
+    def _next_free_bit(self) -> int:
+        used = {d.bit_index for d in self.detectors}
+        for b in range(self.out_bits):
+            if b not in used: return b
+        return int(self.rng.integers(0, self.out_bits))
 
     def build_level(self, lam_d: float = LAM_D, eps: float = DBSCAN_EPS, min_samples: int = DBSCAN_MIN_SAMPLES,
-                    mu_e: float = MU_E_BUILD, attempts: int = DETECT_ATTEMPTS, max_detectors: int | None = DETECT_K) -> None:
+                    mu_e: float = MU_E_BUILD, attempts: int = DETECT_ATTEMPTS, max_detectors: int | None = DETECT_K,
+                    seeds_k: int = SEEDS_TOPK, iou_thr: float = IOU_THR) -> None:
         H, W = self.layout.H, self.layout.W
-        for _ in tqdm(range(attempts), desc=f"detectors λ={lam_d:.2f}"):
-            # Берём случайный прототип как семя активации
-            iy = int(rng.integers(0, H)); ix = int(rng.integers(0, W))
+        seeds = self.rng.permutation(H * W)[:attempts]
+        self.layout._ensure_sim()
+        for s in tqdm(seeds, desc=f"detectors λ={lam_d:.2f}"):
+            iy = int(s // W); ix = int(s % W)
             idx = int(self.layout.grid_idx[iy, ix])
-            q64 = self.layout.codes64[idx]
-            A = self.activation_from_code(q64, lam_a=lam_d)
+            sims_row = self.layout._sim[idx]
+            k = min(int(seeds_k), sims_row.shape[0])
+            top = np.argpartition(sims_row, -k)[-k:]
+            A = self.activation_from_indices(top, lam_a=lam_d)
             clusters = self._cluster_points(A, mu_e=mu_e, eps=eps, min_samples=min_samples)
             if not clusters: continue
             for P in clusters:
                 c_d = self._centroid(P, A)
                 r_d = self._optimal_radius(P, c_d)
-                ys = np.clip(P[:,0].astype(int), 0, H-1)
-                xs = np.clip(P[:,1].astype(int), 0, W-1)
-                n_d = int((self.E_norm[ys, xs] >= mu_e).sum())
-                n_fill = n_d / max(r_d, 1e-6)
-                ok, rem = self._can_insert(c_d, r_d, lam_d, n_fill)
-                if not ok: continue
-                # энергия детектора e_d = Σ A·Ê внутри круга
-                y0 = int(max(0, math.floor(c_d[0]-r_d)))
-                y1 = int(min(H, math.ceil(c_d[0]+r_d)+1))
-                x0 = int(max(0, math.floor(c_d[1]-r_d)))
-                x1 = int(min(W, math.ceil(c_d[1]+r_d)+1))
+                y0 = int(max(0, math.floor(c_d[0]-r_d))); y1 = int(min(H, math.ceil(c_d[0]+r_d)+1))
+                x0 = int(max(0, math.floor(c_d[1]-r_d))); x1 = int(min(W, math.ceil(c_d[1]+r_d)+1))
                 subA = A[y0:y1, x0:x1]; subE = self.E_norm[y0:y1, x0:x1]
                 YY, XX = np.meshgrid(np.arange(y0,y1), np.arange(x0,x1), indexing='ij')
                 mask = ((YY - c_d[0])**2 + (XX - c_d[1])**2) <= (r_d*r_d)
                 e_d = float((subA[mask] * subE[mask]).sum())
+                # NMS-подобная вставка
+                allow = True; to_remove: List[int] = []
+                new_fill = e_d / (math.pi * max(r_d, 1e-6)**2)
+                for i, d in enumerate(self.detectors):
+                    if abs(d.lam - lam_d) > 1e-9:
+                        continue
+                    iou = self._circle_iou(c_d, r_d, d.c, d.r)
+                    if iou <= iou_thr:
+                        continue
+                    old_fill = d.energy / (math.pi * max(d.r, 1e-6)**2)
+                    if new_fill > old_fill:
+                        to_remove.append(i)
+                    else:
+                        allow = False; break
+                if not allow:
+                    continue
+                for j in sorted(to_remove, reverse=True):
+                    self.detectors.pop(j)
                 bit = int(self.rng.integers(0, self.out_bits))
-                for j in sorted(rem, reverse=True): self.detectors.pop(j)
                 self.detectors.append(Detector(c=c_d, r=float(r_d), lam=float(lam_d),
-                                               n_points=int(n_d), energy=e_d, bit_index=bit))
+                                               n_points=int(mask.sum()), energy=e_d, bit_index=bit))
                 if max_detectors is not None and len(self.detectors) >= max_detectors:
                     return
 
@@ -424,7 +456,6 @@ class DetectorSpace:
         H, W = self.layout.H, self.layout.W
         code = np.zeros((self.out_bits,), dtype=bool)
         active: List[int] = []
-        E_ref = float((A * self.E_norm).mean())
         for i, d in enumerate(self.detectors):
             y0 = int(max(0, math.floor(d.c[0]-d.r)))
             y1 = int(min(H, math.ceil(d.c[0]+d.r)+1))
@@ -432,8 +463,10 @@ class DetectorSpace:
             x1 = int(min(W, math.ceil(d.c[1]+d.r)+1))
             subA = A[y0:y1, x0:x1]; subE = self.E_norm[y0:y1, x0:x1]
             YY, XX = np.meshgrid(np.arange(y0,y1), np.arange(x0,x1), indexing='ij')
-            mask = ((YY - d.c[0])**2 + (XX - d.c[1])**2) <= (d.r*d.r)
-            # нормированная энергия детектора
+            circle = ((YY - d.c[0])**2 + (XX - d.c[1])**2) <= (d.r*d.r)
+            mask = circle & (subE >= mu_e)
+            if not np.any(mask):
+                continue
             num = float((subA[mask] * subE[mask]).sum())
             den = float(d.energy) if d.energy > 0.0 else max(float(subE[mask].sum()), 1e-12)
             s = num / max(den, 1e-12)
@@ -479,11 +512,12 @@ def main():
     train_ds = datasets.MNIST(DATA_DIR, train=True,  transform=ToTensor(), download=True)
     test_ds  = datasets.MNIST(DATA_DIR, train=False, transform=ToTensor(), download=True)
 
-    # в NumPy
     if TRAIN_LIMIT is None: trn_limit = len(train_ds)
     else: trn_limit = min(TRAIN_LIMIT, len(train_ds))
 
     N = trn_limit
+    B = GRID * GRID
+
     train_imgs = np.empty((N, 28, 28), dtype=np.float32)
     train_lbls = np.empty((N,), dtype=np.int16)
     for i in tqdm(range(N), desc="Load train to NumPy"):
@@ -499,8 +533,7 @@ def main():
         test_imgs[i] = img.squeeze(0).numpy()
         test_lbls[i] = int(y)
 
-    # ----- Часть A: k-NN на блоках (как базовый ориентир) -----
-    B = GRID * GRID
+    # ----- Часть A: k-NN на блоках -----
     train_codes  = np.empty((N, B, 2), dtype=np.uint64)
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         futs = []
@@ -540,12 +573,13 @@ def main():
     # 2) DAMP‑раскладка прототипов
     damp = DAMPLayoutPacked(codes64=proto_codes64, pops=proto_pops, H=DAMP_H, W=DAMP_W,
                             lam_far=LAM_FAR, lam_near=LAM_NEAR, eta=ETA, r_energy=R_ENERGY, pair_radius=PAIR_RADIUS)
-    damp.run(steps_far=4, steps_near=4, p_per_step=4096)
+    damp.run(steps_far=8, steps_near=8, p_per_step=16384, min_near_steps=2)
 
-    # 3) Пространство детекторов «по науке»
+    # 3) Пространство детекторов «по документу»
     space = DetectorSpace(layout=damp, out_bits=DETECT_K)
     space.build_level(lam_d=LAM_D, eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES,
-                      mu_e=MU_E_BUILD, attempts=DETECT_ATTEMPTS, max_detectors=DETECT_K)
+                      mu_e=MU_E_BUILD, attempts=DETECT_ATTEMPTS, max_detectors=DETECT_K,
+                      seeds_k=SEEDS_TOPK, iou_thr=IOU_THR)
     print("[B] Detectors built:", len(space.detectors))
 
     # 4) Класс‑память: прогоняем train через детекторы и аккумулируем
@@ -565,11 +599,22 @@ def main():
             i, code = f.result()
             counts[int(train_lbls[i])] += code.astype(np.int32)
 
-    k_on = max(1, int(round(TARGET_DENSITY * DETECT_K)))
+    # only-active-bits top‑k
+    active_mask = counts.sum(axis=0) > 0
+    active_idx = np.where(active_mask)[0]
+    num_active = int(active_idx.size)
+    k_on = max(1, int(round(TARGET_DENSITY * max(1, num_active))))
     class_hv = np.zeros((10, DETECT_K), dtype=bool)
     for cls in range(10):
-        idx_top = np.argpartition(counts[cls], -k_on)[-k_on:]
-        class_hv[cls, idx_top] = True
+        if num_active == 0:
+            continue
+        cls_counts_active = counts[cls, active_idx]
+        if k_on >= num_active:
+            sel_rel = np.arange(num_active)
+        else:
+            sel_rel = np.argpartition(cls_counts_active, -k_on)[-k_on:]
+        sel = active_idx[sel_rel]
+        class_hv[cls, sel] = True
 
     # 5) Инференс по детекторному коду
     preds_cls = np.empty((T,), dtype=np.int16)
@@ -589,13 +634,23 @@ def main():
     acc_cls = (preds_cls == test_lbls).mean()
     print(f"[B] Accuracy class-memory (DAMP detectors): {acc_cls:.4f}")
 
+    # ----- Быстрый self-check: распределение числа активных битов -----
+    sample_n = min(256, T)
+    bits_on = []
+    for i in range(sample_n):
+        q64 = blocks_to_u64bits(encode_image_blocks(test_imgs[i]))
+        code, _ = space.detect_from_code(q64, lam_a=LAM_D, mu_e=MU_E_DETECT, mu_d=MU_D)
+        bits_on.append(int(code.sum()))
+    bits_on = np.array(bits_on)
+    zero_frac = float((bits_on == 0).mean())
+    print(f"[Check] bits_on over {sample_n} tests — min/med/max: {bits_on.min()} / {np.median(bits_on)} / {bits_on.max()} | zero_frac={zero_frac:.2%}")
+
     # ----- Сохранение -----
     np.savez_compressed(
         OUT_NPZ,
         train_codes=train_codes,
         train_labels=train_lbls,
         train_pop=train_pop,
-        proto_idx=proto_idx.astype(np.int32),
         proto_codes64=proto_codes64,
         proto_pops=proto_pops,
         damp_grid=damp.grid_idx.astype(np.int32),
@@ -619,7 +674,7 @@ def main():
                 "DETECT_K": DETECT_K, "LAM_D": LAM_D,
                 "MU_E_BUILD": MU_E_BUILD, "MU_E_DETECT": MU_E_DETECT, "MU_D": MU_D,
                 "DBSCAN_EPS": DBSCAN_EPS, "DBSCAN_MIN_SAMPLES": DBSCAN_MIN_SAMPLES,
-                "ATTEMPTS": DETECT_ATTEMPTS
+                "ATTEMPTS": DETECT_ATTEMPTS, "SEEDS_TOPK": SEEDS_TOPK, "IOU_THR": IOU_THR
             },
             "TARGET_DENSITY": TARGET_DENSITY,
             "SEED": SEED,
@@ -634,8 +689,8 @@ def main():
                 "population coding (49 x 128 const‑weight) + concatenation",
                 "baseline: Jaccard + k‑NN on blocks",
                 "DAMP over P=H*W prototypes (packed Jaccard)",
-                "detector space (DBSCAN level, normalized detector energy)",
-                "class-memory (top‑k to target density)",
+                "detector space (DBSCAN level, normalized detector energy, IoU‑NMS)",
+                "class-memory (top‑k only active bits)",
                 "inference by Jaccard to class vectors"
             ]
         }, f, ensure_ascii=False, indent=2)
