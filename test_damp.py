@@ -92,6 +92,40 @@ def save_assets(path: str, damp: "DML.DAMPLayoutTorch", space: "DML.DetectorSpac
         detectors=det,
         class_hv=class_hv.astype(np.uint8)
     )
+    with open(DML.OUT_META, "w", encoding="utf-8") as f:
+        json.dump({
+            "SENSOR_FRONTEND": {
+                "type": "binary_pixels",
+                "NBITS": DML.NBITS,
+                "BIN_THRESHOLD": DML.BIN_THRESHOLD,
+                "note": "Прямое кодирование 28×28 → 784 bool (без 7×7 и популяционного кодирования)."
+            },
+            "DAMP": {
+                "H": DML.DAMP_H, "W": DML.DAMP_W,
+                "LAM_FAR": DML.LAM_FAR, "LAM_NEAR": DML.LAM_NEAR, "ETA": DML.ETA,
+                "R_ENERGY": DML.R_ENERGY, "PAIR_RADIUS": DML.PAIR_RADIUS
+            },
+            "DETECTORS": {
+                "DETECT_K": DML.DETECT_K, "LAM_D": DML.LAM_D,
+                "MU_E_BUILD": DML.MU_E_BUILD, "MU_E_DETECT": DML.MU_E_DETECT, "MU_D": DML.MU_D,
+                "DBSCAN_EPS": DML.DBSCAN_EPS, "DBSCAN_MIN_SAMPLES": DML.DBSCAN_MIN_SAMPLES,
+                "ATTEMPTS": DML.DETECT_ATTEMPTS,
+                "SIGMA": DML.SIGMA,
+                "strict_build": True,
+                "nms_rule": "no-center-overlap, keep higher n/r, parallel candidates",
+                "multi_stimuli_aggregation": "A = max_s τ(sim(s,·))"
+            },
+            "TARGET_DENSITY": DML.TARGET_DENSITY,
+            "SEED": DML.SEED,
+            "DEVICE": str(DML.DEVICE),
+            "pipeline": [
+                "binary pixel coding (28×28 ≥ threshold) → 784-bit bool code",
+                "DAMP over P=H×W prototypes (Jaccard GPU, S on CPU, grid_idx-aware)",
+                "detector space (DBSCAN level, e_d on Ê≥μ_e, no center overlap, keep higher n/r, parallel candidates)",
+                "class-memory (top-k only active bits; batch detect via A@W; optional σ saturation; multi-stimuli max)",
+                "inference by Jaccard to class vectors"
+            ]
+        }, f, ensure_ascii=False, indent=2)
 
 
 def load_assets(path: str, detect_k_arg: int,
@@ -266,8 +300,8 @@ def main():
         results.append({
             "idx": ix,
             "prediction": int(pred),
-            "confidence": float(conf),
             "truth": truth,
+            "confidence": float(conf),
             "bits_on": int(bits_on),
         })
 

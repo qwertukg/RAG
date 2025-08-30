@@ -376,7 +376,7 @@ def main():
     ap.add_argument("--show", action="store_true", help="Показывать графики на экране (помимо сохранения).")
 
     # Прочее
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=42)
 
     args = ap.parse_args()
     rng = np.random.default_rng(args.seed)
@@ -463,6 +463,7 @@ def main():
     preds_batch = DML.predict_batch(space, class_hv, te_codes_sel,
                                     lam_a=args.lam_d, mu_e_detect=args.mu_e_detect, mu_d=args.mu_d,
                                     sigma=args.sigma)
+    results = []
     for j, ix in enumerate(idxs):
         pred, conf, bits_on = preds_batch[j]
         truth = int(te[ix][1])
@@ -473,7 +474,17 @@ def main():
             "truth": truth,
             "bits_on": int(bits_on),
         }
-        print(json.dumps(rec, ensure_ascii=False))
+        results.append(rec)
+        # print(json.dumps(rec, ensure_ascii=False))
+
+    # ==== Отчёт ====
+    if len(results) == 1:
+        print(results[0])
+    else:
+        ok = sum(int(r["prediction"] == r["truth"]) for r in results)
+        print(f"Batch {len(results)} — acc={ok / len(results):.3f}")
+        for r in results:
+            print(r)
 
     # ==== Показ на экран (опционально) ====
     if args.show:
@@ -489,7 +500,7 @@ def main():
                 continue
             img = plt.imread(path)
             h, w = img.shape[:2]
-            fig = plt.figure(figsize=(w/150, h/150))
+            fig = plt.figure(figsize=(w/100, h/100))
             ax = fig.add_axes([0, 0, 1, 1])
             ax.imshow(img)
             ax.axis("off")

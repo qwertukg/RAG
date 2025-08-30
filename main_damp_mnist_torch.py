@@ -8,6 +8,9 @@ MNIST → DAMP (§5) → Детекторы (§6) — реализация на 
   2) Цветовое объединение с насыщением σ: после подсчёта E(d,A) и порога μ_d
      оставляем на объект не более σ детекторов с максимумом энергии.
 
+ВАЖНО: сенсорный фронт упрощён — работаем сразу с оригинальным размером MNIST 28×28.
+Кодирование: простая бинаризация пикселей по порогу (по умолчанию 0.5) → булев вектор длины 28*28.
+
 Зависимости: torch, torchvision, numpy, tqdm
 """
 
@@ -27,12 +30,9 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== ПАРАМЕТРЫ =====================
-# Сенсорный фронт и коды
-GRID = 7                   # 28x28 -> 7x7 (avgpool 4x4)
-LEVELS = 4                 # уровни квантизации 0..LEVELS
-BITS_PER_CELL = 128
-K_BITS_PER_LEVEL = 16      # вес кода уровня (const-weight)
-NBITS = GRID * GRID * BITS_PER_CELL
+# Сенсорный фронт и коды (БЕЗ 7×7 и популяционного кодирования — сразу 28×28)
+BIN_THRESHOLD = 0.5        # порог бинаризации пикселей
+NBITS = 28 * 28            # код = булев вектор длины 784 (28×28)
 
 # DAMP раскладка прототипов
 DAMP_H = 32               # 32x32 = 1024 прототипов
@@ -54,7 +54,7 @@ DBSCAN_MIN_SAMPLES = 2
 DETECT_ATTEMPTS = 1024
 
 # Цветовое объединение: насыщение σ (None = без ограничения)
-SIGMA: Optional[int] = 64  # напр. 64 или 128, чтобы жёстко ограничить число выставленных бит
+SIGMA: Optional[int] = 128  # напр. 64 или 128, чтобы жёстко ограничить число выставленных бит
 
 # Класс-память
 TARGET_DENSITY = 0.35
@@ -74,29 +74,15 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 GEN = torch.Generator(device="cpu").manual_seed(SEED)
 _TRUE = torch.tensor(True, device=DEVICE, dtype=torch.bool)
 
-# ===================== КОДБУК УРОВНЕЙ (Torch) =====================
-# level_code_bool: [LEVELS+1, BITS_PER_CELL] (level 0 — все нули)
-
-def make_level_code_bool() -> torch.BoolTensor:
-    code = torch.zeros((LEVELS + 1, BITS_PER_CELL), dtype=torch.bool)
-    for lvl in range(1, LEVELS + 1):
-        idx = torch.randperm(BITS_PER_CELL, generator=GEN)[:K_BITS_PER_LEVEL]
-        code[lvl, idx] = True
-    return code
-
-LEVEL_CODE_BOOL = make_level_code_bool().to(DEVICE)
-
 # ===================== КОДИРОВАНИЕ (Torch) =====================
 
 @torch.no_grad()
-def encode_batch_bool(imgs: torch.Tensor) -> torch.BoolTensor:
-    """imgs: [N,1,28,28] float in [0,1] → [N, NBITS] bool."""
-    x = F.avg_pool2d(imgs, kernel_size=4, stride=4)  # [N,1,7,7]
-    x = x.squeeze(1)                                  # [N,7,7]
-    q = torch.clamp(torch.floor(x * LEVELS), 0, LEVELS).to(torch.long)  # [N,7,7]
-    N = q.shape[0]
-    codes = LEVEL_CODE_BOOL[q.view(N, -1)]            # [N,49,128]
-    return codes.reshape(N, -1)                       # [N, NBITS]
+def encode_batch_bool(imgs: torch.Tensor, threshold: float = BIN_THRESHOLD) -> torch.BoolTensor:
+    """imgs: [N,1,28,28] float in [0,1] → [N, NBITS=784] bool (прямая бинаризация пикселей)."""
+    N = imgs.shape[0]
+    # [N, 28, 28] → [N, 784] → bool
+    flat = imgs.squeeze(1).reshape(N, -1)
+    return (flat >= threshold).to(torch.bool).to(DEVICE)
 
 # ===================== Жаккар на GPU =====================
 
@@ -637,7 +623,7 @@ def main():
     # Прототипы для DAMP
     P = DAMP_H * DAMP_W
     proto_idx = torch.randperm(trn_limit, generator=GEN)[:P]
-    proto_codes = encode_batch_bool(train_imgs[proto_idx])
+    proto_codes = encode_batch_bool(train_imgs[proto_idx])  # [P, 784] bool
 
     # DAMP
     damp = DAMPLayoutTorch(codes_bool=proto_codes, H=DAMP_H, W=DAMP_W,
@@ -651,8 +637,8 @@ def main():
     space.finalize_detection_matrix(mu_e=MU_E_DETECT)
     print("[Detectors] built:", len(space.detectors), "| valid:", (space.W_detect.shape[1] if space.W_detect is not None else 0))
 
-    # Память классов (один стимул на объект; для нескольких: соберите [N,M,B] и передайте сюда)
-    train_codes_bool = encode_batch_bool(train_imgs)  # [N,B]
+    # Память классов
+    train_codes_bool = encode_batch_bool(train_imgs)  # [N, 784]
     class_hv = build_class_memory(space,
                                   codes_bool=train_codes_bool,
                                   labels=train_lbls,
@@ -663,7 +649,7 @@ def main():
     # Оценка на всём тесте (демо)
     T = len(test_ds)
     test_imgs = torch.stack([test_ds[i][0] for i in range(T)], dim=0).to(DEVICE)
-    test_codes_bool = encode_batch_bool(test_imgs)  # [T,B]
+    test_codes_bool = encode_batch_bool(test_imgs)  # [T, 784]
     preds = predict_batch(space, class_hv, test_codes_bool,
                           lam_a=LAM_D, mu_e_detect=MU_E_DETECT, mu_d=MU_D,
                           sigma=SIGMA)
@@ -683,10 +669,12 @@ def main():
     )
     with open(OUT_META, "w", encoding="utf-8") as f:
         json.dump({
-            "GRID": GRID,
-            "LEVELS": LEVELS,
-            "BITS_PER_CELL": BITS_PER_CELL,
-            "K_BITS_PER_LEVEL": K_BITS_PER_LEVEL,
+            "SENSOR_FRONTEND": {
+                "type": "binary_pixels",
+                "NBITS": NBITS,
+                "BIN_THRESHOLD": BIN_THRESHOLD,
+                "note": "Прямое кодирование 28×28 → 784 bool (без 7×7 и популяционного кодирования)."
+            },
             "DAMP": {
                 "H": DAMP_H, "W": DAMP_W,
                 "LAM_FAR": LAM_FAR, "LAM_NEAR": LAM_NEAR, "ETA": ETA,
@@ -706,10 +694,9 @@ def main():
             "SEED": SEED,
             "DEVICE": str(DEVICE),
             "pipeline": [
-                "28x28 -> 7x7 (avgpool + quantize)",
-                "population coding (49 x 128 const-weight) + concatenation (bool)",
-                "DAMP over P=H*W prototypes (Jaccard GPU, S on CPU, grid_idx-aware)",
-                "detector space (DBSCAN level, e_d on Ê>=μ_e, no center overlap, keep higher n/r, parallel candidates)",
+                "binary pixel coding (28×28 ≥ threshold) → 784-bit bool code",
+                "DAMP over P=H×W prototypes (Jaccard GPU, S on CPU, grid_idx-aware)",
+                "detector space (DBSCAN level, e_d on Ê≥μ_e, no center overlap, keep higher n/r, parallel candidates)",
                 "class-memory (top-k only active bits; batch detect via A@W; optional σ saturation; multi-stimuli max)",
                 "inference by Jaccard to class vectors"
             ]
