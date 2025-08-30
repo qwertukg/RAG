@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Смоук‑тест для новой реализации на PyTorch/CUDA:
+Смоук-тест для новой реализации на PyTorch/CUDA:
   TRAIN: строит прототипы → DAMP (GPU) → детекторы (гл. 6) → class_hv, затем предсказывает
   LOAD: загружает сохранённые артефакты (.npz) и сразу предсказывает
 
@@ -10,8 +10,8 @@
 Примеры:
   # Полное обучение и предсказание для трёх индексов
   python test_damp.py --idx 0,1,2 --train-n 10000 --proto 32x32 --detect-k 1024 \
-    --lam-d 0.03 --mu-e-build 0.01 --mu-e-detect 0.01 --mu-d 0.06 \
-    --eps 6.0 --min-samples 2 --attempts 2048 \
+    --lam-d 0.70 --mu-e-build 0.02 --mu-e-detect 0.02 --mu-d 0.08 \
+    --eps 5.0 --min-samples 2 --attempts 1024 \
     --steps-far 8 --steps-near 8 --p-per-step 16384 --min-near-steps 2 --target-density 0.35 \
     --save damp_assets.npz
 
@@ -29,8 +29,8 @@ import torch
 from torchvision import datasets
 from torchvision.transforms import ToTensor
 
-# --- Импорт новой реализации ---
-import main_damp_mnist_v2 as m
+# --- Импорт НОВОЙ реализации ---
+import main_damp_mnist_torch as DML
 
 
 # ================= Утилиты парсинга =================
@@ -56,8 +56,8 @@ def parse_indices(spec: str) -> List[int]:
 @torch.no_grad()
 def encode_one_bool(img28_np: np.ndarray) -> torch.BoolTensor:
     """28×28 numpy → [NBITS] bool на DEVICE."""
-    t = torch.from_numpy(img28_np).unsqueeze(0).unsqueeze(0).to(m.DEVICE)  # [1,1,28,28]
-    return m.encode_batch_bool(t)[0]  # [NBITS]
+    t = torch.from_numpy(img28_np).unsqueeze(0).unsqueeze(0).to(DML.DEVICE)  # [1,1,28,28]
+    return DML.encode_batch_bool(t)[0]  # [NBITS]
 
 
 def build_space(train_imgs_t: torch.Tensor, H: int, W: int, train_n: int,
@@ -66,24 +66,23 @@ def build_space(train_imgs_t: torch.Tensor, H: int, W: int, train_n: int,
                 detect_k: int, lam_d: float, mu_e_build: float, eps: float,
                 min_samples: int, attempts: int,
                 rng: np.random.Generator):
-    """Собрать DAMP+детекторы с нуля. Возвращает (space, damp, proto_idx)."""
+    """Собрать DAMP+детекторы с нуля. Возвращает (space, damp, proto_idx_np)."""
     P = H * W
     idx = rng.choice(train_n, size=P, replace=False)
-    proto_codes = m.encode_batch_bool(train_imgs_t[idx].to(m.DEVICE))  # [P, NBITS] bool
-    proto_pops = proto_codes.float().sum(dim=1)                        # [P]
+    proto_codes = DML.encode_batch_bool(train_imgs_t[idx].to(DML.DEVICE))     # [P, NBITS] bool
 
-    damp = m.DAMPLayoutTorch(proto_codes, proto_pops, H=H, W=W,
-                             lam_far=lam_far, lam_near=lam_near,
-                             eta=m.ETA, r_energy=m.R_ENERGY, pair_radius=m.PAIR_RADIUS)
+    damp = DML.DAMPLayoutTorch(codes_bool=proto_codes, H=H, W=W,
+                               lam_far=lam_far, lam_near=lam_near,
+                               eta=DML.ETA, r_energy=DML.R_ENERGY, pair_radius=DML.PAIR_RADIUS)
     damp.run(steps_far=steps_far, steps_near=steps_near, p_per_step=p_per_step, min_near_steps=min_near_steps)
 
-    space = m.DetectorSpace(layout=damp, out_bits=detect_k)
+    space = DML.DetectorSpace(layout=damp, out_bits=detect_k)
     space.build_level(lam_d=lam_d, eps=eps, min_samples=min_samples,
                       mu_e=mu_e_build, attempts=attempts, max_detectors=detect_k)
-    return space, damp, idx
+    return space, damp, idx.astype(np.int32)
 
 
-def save_assets(path: str, damp: "m.DAMPLayoutTorch", space: "m.DetectorSpace",
+def save_assets(path: str, damp: "DML.DAMPLayoutTorch", space: "DML.DetectorSpace",
                 proto_idx: np.ndarray, class_hv: np.ndarray) -> None:
     det = np.array([(d.c[0], d.c[1], d.r, d.lam, d.n_points, d.energy, d.bit_index)
                     for d in space.detectors], dtype=np.float32)
@@ -96,8 +95,8 @@ def save_assets(path: str, damp: "m.DAMPLayoutTorch", space: "m.DetectorSpace",
 
 
 def load_assets(path: str, detect_k_arg: int,
-                train_ds: datasets.VisionDataset) -> tuple[m.DetectorSpace, np.ndarray]:
-    """Восстановить пространство детекторов и класс‑память. Протокоды восстанавливаем по proto_idx."""
+                train_ds: datasets.VisionDataset) -> tuple[DML.DetectorSpace, np.ndarray]:
+    """Восстановить пространство детекторов и класс-память. Протокоды восстанавливаем по proto_idx."""
     z = np.load(path, allow_pickle=True)
     grid = z["damp_grid"].astype(int)
     proto_idx = z["proto_idx"].astype(int)
@@ -105,24 +104,23 @@ def load_assets(path: str, detect_k_arg: int,
     class_hv = z.get("class_hv", None)
 
     # восстановим коды прототипов
-    imgs = torch.stack([train_ds[i][0] for i in proto_idx], dim=0).to(m.DEVICE)  # [P,1,28,28]
-    proto_codes = m.encode_batch_bool(imgs)
-    proto_pops  = proto_codes.float().sum(dim=1)
+    imgs = torch.stack([train_ds[i][0] for i in proto_idx], dim=0).to(DML.DEVICE)  # [P,1,28,28]
+    proto_codes = DML.encode_batch_bool(imgs)
 
     # DAMP
     H, W = grid.shape
-    damp = m.DAMPLayoutTorch(proto_codes, proto_pops, H=H, W=W,
-                             lam_far=m.LAM_FAR, lam_near=m.LAM_NEAR,
-                             eta=m.ETA, r_energy=m.R_ENERGY, pair_radius=m.PAIR_RADIUS)
+    damp = DML.DAMPLayoutTorch(codes_bool=proto_codes, H=H, W=W,
+                               lam_far=DML.LAM_FAR, lam_near=DML.LAM_NEAR,
+                               eta=DML.ETA, r_energy=DML.R_ENERGY, pair_radius=DML.PAIR_RADIUS)
     damp.grid_idx = grid
 
     # Space
     max_bit = int(det[:, 6].max()) if det.size else -1
     out_bits = max(detect_k_arg, max_bit + 1)
-    space = m.DetectorSpace(damp, out_bits=out_bits)
+    space = DML.DetectorSpace(damp, out_bits=out_bits)
     space.detectors = [
-        m.Detector(c=(float(r[0]), float(r[1])), r=float(r[2]), lam=float(r[3]),
-                   n_points=int(r[4]), energy=float(r[5]), bit_index=int(r[6]))
+        DML.Detector(c=(float(r[0]), float(r[1])), r=float(r[2]), lam=float(r[3]),
+                     n_points=int(r[4]), energy=float(r[5]), bit_index=int(r[6]))
         for r in det
     ]
 
@@ -143,13 +141,13 @@ def main():
                     help="Сколько train-примеров использовать для построения класс-памяти и выборки прототипов для DAMP (§5, §6).")
     ap.add_argument("--proto", type=str, default="32x32",
                     help="Размер решётки прототипов DAMP в формате HxW; общее число прототипов P=H·W влияет на топологию и качество (§5).")
-    ap.add_argument("--detect-k", type=int, default=getattr(m, "DETECT_K", 512),
+    ap.add_argument("--detect-k", type=int, default=getattr(DML, "DETECT_K", 512),
                     help="Максимальное число детекторов/длина выходного кода; каждому детектору соответствует bit_index; коллизии допустимы (§6).")
 
     # DAMP
-    ap.add_argument("--lam-far", type=float, default=getattr(m, "LAM_FAR", 0.65),
+    ap.add_argument("--lam-far", type=float, default=getattr(DML, "LAM_FAR", 0.65),
                     help="Порог λ для далёкой фазы DAMP в τ(x)=x·σ(η(x−λ)); определяет «репульсию» на дальних шагах (§5.3–§5.4).")
-    ap.add_argument("--lam-near", type=float, default=getattr(m, "LAM_NEAR", 0.80),
+    ap.add_argument("--lam-near", type=float, default=getattr(DML, "LAM_NEAR", 0.80),
                     help="Порог λ для ближней фазы DAMP; регулирует локальное упорядочивание и «притяжение» (§5.3–§5.4).")
     ap.add_argument("--steps-far", type=int, default=8,
                     help="Число итераций фазы 'far' (перестановки пар по критерию φ_s<φ_c); 0 отключает фазу (§5.4).")
@@ -161,25 +159,25 @@ def main():
                     help="Минимально гарантированное число near-итераций до ранней остановки даже при нулевых перестановках; стабилизирует локальную топологию (§5.4).")
 
     # Детекторы (построение)
-    ap.add_argument("--lam-d", type=float, default=getattr(m, "LAM_D", 0.70),
+    ap.add_argument("--lam-d", type=float, default=getattr(DML, "LAM_D", 0.70),
                     help="Порог λ в τ для построения/детектирования A^λ; управляет тем, какие прототипы вносят вклад в карту активаций (§6.1).")
-    ap.add_argument("--mu-e-build", type=float, default=getattr(m, "MU_E_BUILD", 0.02),
+    ap.add_argument("--mu-e-build", type=float, default=getattr(DML, "MU_E_BUILD", 0.02),
                     help="Порог по нормированной энергии Ê при построении: учитываются только точки с Ê≥μ_e при поиске кластеров на A^λ (§6.2).")
-    ap.add_argument("--eps", type=float, default=getattr(m, "DBSCAN_EPS", 5.0),
+    ap.add_argument("--eps", type=float, default=getattr(DML, "DBSCAN_EPS", 5.0),
                     help="Параметр ε (радиус окрестности) алгоритма DBSCAN для кластеризации точек {Ê≥μ_e} на карте A^λ (§6.2).")
-    ap.add_argument("--min-samples", type=int, default=getattr(m, "DBSCAN_MIN_SAMPLES", 2),
+    ap.add_argument("--min-samples", type=int, default=getattr(DML, "DBSCAN_MIN_SAMPLES", 2),
                     help="Параметр min_samples DBSCAN — минимальный размер кластера, чтобы считать его валидным (§6.2).")
-    ap.add_argument("--attempts", type=int, default=getattr(m, "DETECT_ATTEMPTS", 1024),
+    ap.add_argument("--attempts", type=int, default=getattr(DML, "DETECT_ATTEMPTS", 1024),
                     help="Сколько сидов/центров перебрать для генерации кандидатов детекторов; больше — выше покрытие, дольше расчёт (§6.2).")
 
     # Детекторы (детектирование)
-    ap.add_argument("--mu-e-detect", type=float, default=getattr(m, "MU_E_DETECT", 0.02),
+    ap.add_argument("--mu-e-detect", type=float, default=getattr(DML, "MU_E_DETECT", 0.02),
                     help="Порог Ê при инференсе: в круге детектора учитываются только точки с Ê≥μ_e при вычислении E(d,A) (§6.3).")
-    ap.add_argument("--mu-d", type=float, default=getattr(m, "MU_D", 0.08),
+    ap.add_argument("--mu-d", type=float, default=getattr(DML, "MU_D", 0.08),
                     help="Порог срабатывания детектора μ_d: детектор активен если E(d,A)/e_d ≥ μ_d; нормировка на энергию детектора (§6.3).")
 
     # Память классов
-    ap.add_argument("--target-density", type=float, default=getattr(m, "TARGET_DENSITY", 0.35),
+    ap.add_argument("--target-density", type=float, default=getattr(DML, "TARGET_DENSITY", 0.35),
                     help="Целевая доля единиц в класс-векторе после порогования по счётчикам только среди реально активных битов; задаёт разреженность памяти (§6.4).")
 
     # LOAD/SAVE
@@ -195,7 +193,9 @@ def main():
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    data_dir = getattr(m, "DATA_DIR", "./data")
+    data_dir = getattr(DML, "DATA_DIR", "./data")
+
+    print(f"[Info] Device: {DML.DEVICE}")
 
     # ==== ДАННЫЕ ====
     tr = datasets.MNIST(data_dir, train=True,  transform=ToTensor(), download=True)
@@ -206,17 +206,18 @@ def main():
         space, class_hv = load_assets(args.load, detect_k_arg=args.detect_k, train_ds=tr)
         print(f"[LOAD] Detectors loaded: {len(space.detectors)} | out_bits={space.out_bits}")
         if class_hv is None:
+            # Нужно построить память классов на лету (на GPU)
             train_n = min(args.train_n, len(tr))
-            train_imgs_t = torch.stack([tr[i][0] for i in range(train_n)], dim=0).to(m.DEVICE)
-            train_codes = m.encode_batch_bool(train_imgs_t)
+            train_imgs_t = torch.stack([tr[i][0] for i in range(train_n)], dim=0).to(DML.DEVICE)
+            train_codes = DML.encode_batch_bool(train_imgs_t)
             train_lbls = np.array([int(tr[i][1]) for i in range(train_n)], dtype=np.int16)
-            class_hv = m.build_class_memory(space, imgs=train_codes, labels=train_lbls,
-                                            lam_a=args.lam_d, mu_e_detect=args.mu_e_detect, mu_d=args.mu_d,
-                                            detect_k=space.out_bits, target_density=args.target_density)
+            class_hv = DML.build_class_memory(space, codes_bool=train_codes, labels=train_lbls,
+                                              lam_a=args.lam_d, mu_e_detect=args.mu_e_detect, mu_d=args.mu_d,
+                                              detect_k=space.out_bits, target_density=args.target_density)
     else:
         # ==== TRAIN режим ====
         train_n = min(args.train_n, len(tr))
-        train_imgs_t = torch.stack([tr[i][0] for i in range(train_n)], dim=0).to(m.DEVICE)  # [N,1,28,28]
+        train_imgs_t = torch.stack([tr[i][0] for i in range(train_n)], dim=0).to(DML.DEVICE)  # [N,1,28,28]
         train_lbls = np.array([int(tr[i][1]) for i in range(train_n)], dtype=np.int16)
 
         H, W = parse_hw(args.proto)
@@ -230,10 +231,10 @@ def main():
             rng=rng)
         print(f"[TRAIN] Detectors built: {len(space.detectors)}")
 
-        train_codes = m.encode_batch_bool(train_imgs_t)
-        class_hv = m.build_class_memory(space, imgs=train_codes, labels=train_lbls,
-                                        lam_a=args.lam_d, mu_e_detect=args.mu_e_detect, mu_d=args.mu_d,
-                                        detect_k=args.detect_k, target_density=args.target_density)
+        train_codes = DML.encode_batch_bool(train_imgs_t)
+        class_hv = DML.build_class_memory(space, codes_bool=train_codes, labels=train_lbls,
+                                          lam_a=args.lam_d, mu_e_detect=args.mu_e_detect, mu_d=args.mu_d,
+                                          detect_k=args.detect_k, target_density=args.target_density)
 
         if args.save:
             save_assets(args.save, damp=damp, space=space, proto_idx=proto_idx, class_hv=class_hv)
@@ -242,29 +243,30 @@ def main():
     # ==== ПРЕДСКАЗАНИЯ ====
     idxs = parse_indices(args.idx)
     results = []
-    for ix in idxs:
-        img, truth = te[ix]
-        img = img.squeeze(0).numpy()
-        q_bool = encode_one_bool(img)
-        pred, conf, bits_on = m.predict_digit(space, class_hv, q_bool,
-                                              lam_a=args.lam_d, mu_e_detect=args.mu_e_detect, mu_d=args.mu_d)
+    # подготовим векторизованный инференс
+    te_imgs_sel = torch.stack([te[i][0] for i in idxs], dim=0).to(DML.DEVICE)
+    te_codes_sel = DML.encode_batch_bool(te_imgs_sel)
+    preds_batch = DML.predict_batch(space, class_hv, te_codes_sel,
+                                    lam_a=args.lam_d, mu_e_detect=args.mu_e_detect, mu_d=args.mu_d)
+    for j, ix in enumerate(idxs):
+        pred, conf, bits_on = preds_batch[j]
+        truth = int(te[ix][1])
         results.append({
             "idx": ix,
-            "prediction": pred,
-            "confidence": conf,
-            "truth": int(truth),
-            "bits_on": bits_on,
+            "prediction": int(pred),
+            "confidence": float(conf),
+            "truth": truth,
+            "bits_on": int(bits_on),
         })
 
     # ==== Диагностика по bits_on на батче из теста ====
     sample_n = min(128, len(te))
-    te_imgs_t = torch.stack([te[i][0] for i in range(sample_n)], dim=0).to(m.DEVICE)
-    te_codes = m.encode_batch_bool(te_imgs_t)
-    bits_on_list = []
-    for i in range(sample_n):
-        code, _ = space.detect_from_code(te_codes[i], lam_a=args.lam_d, mu_e=args.mu_e_detect, mu_d=args.mu_d)
-        bits_on_list.append(int(code.sum()))
-    bits_on_arr = np.array(bits_on_list)
+    te_imgs_t = torch.stack([te[i][0] for i in range(sample_n)], dim=0).to(DML.DEVICE)
+    te_codes = DML.encode_batch_bool(te_imgs_t)
+    space.finalize_detection_matrix(mu_e=args.mu_e_detect)
+    with torch.no_grad():
+        codes = space.detect_batch_from_codes(te_codes, lam_a=args.lam_d, mu_d=args.mu_d).cpu().numpy()
+    bits_on_arr = codes.sum(axis=1).astype(int)
     print(f"[Check] bits_on over {sample_n} tests — min/med/max: {bits_on_arr.min()} / {np.median(bits_on_arr)} / {bits_on_arr.max()} | zero_frac={(bits_on_arr==0).mean():.2%}")
 
     # ==== Отчёт ====
