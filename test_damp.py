@@ -135,37 +135,63 @@ def load_assets(path: str, detect_k_arg: int,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--idx", type=str, default="0", help="индекс(ы) test MNIST: '0' или '0,1,2'")
+    ap.add_argument("--idx", type=str, default="0",
+                    help="Список индексов из тестового MNIST для предсказания, без пробелов (напр. '0' или '0,1,2').")
 
     # TRAIN режим
-    ap.add_argument("--train-n", type=int, default=8000, help="сколько train примеров для памяти")
-    ap.add_argument("--proto", type=str, default="32x32", help="HxW прототипов для DAMP, напр. 32x32")
-    ap.add_argument("--detect-k", type=int, default=getattr(m, "DETECT_K", 512), help="макс. детекторов / длина кода")
+    ap.add_argument("--train-n", type=int, default=10000,
+                    help="Сколько train-примеров использовать для построения класс-памяти и выборки прототипов для DAMP (§5, §6).")
+    ap.add_argument("--proto", type=str, default="32x32",
+                    help="Размер решётки прототипов DAMP в формате HxW; общее число прототипов P=H·W влияет на топологию и качество (§5).")
+    ap.add_argument("--detect-k", type=int, default=getattr(m, "DETECT_K", 512),
+                    help="Максимальное число детекторов/длина выходного кода; каждому детектору соответствует bit_index; коллизии допустимы (§6).")
+
     # DAMP
-    ap.add_argument("--lam-far", type=float, default=getattr(m, "LAM_FAR", 0.03))
-    ap.add_argument("--lam-near", type=float, default=getattr(m, "LAM_NEAR", 0.03))
-    ap.add_argument("--steps-far", type=int, default=4)
-    ap.add_argument("--steps-near", type=int, default=4)
-    ap.add_argument("--p-per-step", type=int, default=4096)
-    ap.add_argument("--min-near-steps", type=int, default=2, help="гарантировать ≥N near-шагов")
+    ap.add_argument("--lam-far", type=float, default=getattr(m, "LAM_FAR", 0.65),
+                    help="Порог λ для далёкой фазы DAMP в τ(x)=x·σ(η(x−λ)); определяет «репульсию» на дальних шагах (§5.3–§5.4).")
+    ap.add_argument("--lam-near", type=float, default=getattr(m, "LAM_NEAR", 0.80),
+                    help="Порог λ для ближней фазы DAMP; регулирует локальное упорядочивание и «притяжение» (§5.3–§5.4).")
+    ap.add_argument("--steps-far", type=int, default=8,
+                    help="Число итераций фазы 'far' (перестановки пар по критерию φ_s<φ_c); 0 отключает фазу (§5.4).")
+    ap.add_argument("--steps-near", type=int, default=8,
+                    help="Число итераций фазы 'near' (локальная оптимизация по критерию φ_s>φ_c) (§5.4).")
+    ap.add_argument("--p-per-step", type=int, default=16384,
+                    help="Сколько случайных пар прототипов рассматривать на одном шаге DAMP; больше — быстрее сходимость, но дольше шаг (§5.4).")
+    ap.add_argument("--min-near-steps", type=int, default=2,
+                    help="Минимально гарантированное число near-итераций до ранней остановки даже при нулевых перестановках; стабилизирует локальную топологию (§5.4).")
+
     # Детекторы (построение)
-    ap.add_argument("--lam-d", type=float, default=getattr(m, "LAM_D", 0.03))
-    ap.add_argument("--mu-e-build", type=float, default=getattr(m, "MU_E_BUILD", 0.02))
-    ap.add_argument("--eps", type=float, default=getattr(m, "DBSCAN_EPS", 5.0))
-    ap.add_argument("--min-samples", type=int, default=getattr(m, "DBSCAN_MIN_SAMPLES", 2))
-    ap.add_argument("--attempts", type=int, default=getattr(m, "DETECT_ATTEMPTS", 1024))
+    ap.add_argument("--lam-d", type=float, default=getattr(m, "LAM_D", 0.70),
+                    help="Порог λ в τ для построения/детектирования A^λ; управляет тем, какие прототипы вносят вклад в карту активаций (§6.1).")
+    ap.add_argument("--mu-e-build", type=float, default=getattr(m, "MU_E_BUILD", 0.02),
+                    help="Порог по нормированной энергии Ê при построении: учитываются только точки с Ê≥μ_e при поиске кластеров на A^λ (§6.2).")
+    ap.add_argument("--eps", type=float, default=getattr(m, "DBSCAN_EPS", 5.0),
+                    help="Параметр ε (радиус окрестности) алгоритма DBSCAN для кластеризации точек {Ê≥μ_e} на карте A^λ (§6.2).")
+    ap.add_argument("--min-samples", type=int, default=getattr(m, "DBSCAN_MIN_SAMPLES", 2),
+                    help="Параметр min_samples DBSCAN — минимальный размер кластера, чтобы считать его валидным (§6.2).")
+    ap.add_argument("--attempts", type=int, default=getattr(m, "DETECT_ATTEMPTS", 1024),
+                    help="Сколько сидов/центров перебрать для генерации кандидатов детекторов; больше — выше покрытие, дольше расчёт (§6.2).")
+
     # Детекторы (детектирование)
-    ap.add_argument("--mu-e-detect", type=float, default=getattr(m, "MU_E_DETECT", 0.02))
-    ap.add_argument("--mu-d", type=float, default=getattr(m, "MU_D", 0.08))
+    ap.add_argument("--mu-e-detect", type=float, default=getattr(m, "MU_E_DETECT", 0.02),
+                    help="Порог Ê при инференсе: в круге детектора учитываются только точки с Ê≥μ_e при вычислении E(d,A) (§6.3).")
+    ap.add_argument("--mu-d", type=float, default=getattr(m, "MU_D", 0.08),
+                    help="Порог срабатывания детектора μ_d: детектор активен если E(d,A)/e_d ≥ μ_d; нормировка на энергию детектора (§6.3).")
+
     # Память классов
-    ap.add_argument("--target-density", type=float, default=getattr(m, "TARGET_DENSITY", 0.35))
+    ap.add_argument("--target-density", type=float, default=getattr(m, "TARGET_DENSITY", 0.35),
+                    help="Целевая доля единиц в класс-векторе после порогования по счётчикам только среди реально активных битов; задаёт разреженность памяти (§6.4).")
 
     # LOAD/SAVE
-    ap.add_argument("--load", type=str, default=None, help="путь к .npz с готовыми детекторами/раскладкой/памятью")
-    ap.add_argument("--save", type=str, default=None, help="сохранить артефакты в .npz после обучения")
+    ap.add_argument("--load", type=str, default=None,
+                    help="Путь к .npz с артефактами (раскладка DAMP, детекторы, class_hv); в этом режиме обучение пропускается, версии алгоритма должны совпадать (§5–§6).")
+    ap.add_argument("--save", type=str, default=None,
+                    help="Сохранить артефакты (раскладка DAMP, детекторы, class_hv) в .npz для последующих запусков без переобучения (§5–§6).")
 
     # Прочее
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="ГПСЧ для воспроизводимости (выбор прототипов, порядок пар DAMP, сиды детекторов, битовые индексы и пр.).")
+
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
